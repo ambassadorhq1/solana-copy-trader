@@ -63,15 +63,41 @@ def compute_stats(trades, launch, cfg, t=None):
     }
 
 
+# scoring.profile: "strict" = the scoring block as written; "relaxed" (paper default) loosens only the performance rules
+# for fresh wallets. Hard filters (sniper, dev/creator, bundler, funder cluster, wash, insider, fast-dump) never change.
+PROFILES = {
+    "strict": {},
+    "relaxed": {"min_closed_trades": 3, "min_win_rate": 0.40, "min_realized_pnl_sol": 0.0, "min_median_win_mult": 1.5,
+                "max_top_trade_share": 0.8, "max_median_entry_min": 240, "min_median_hold_min": 1,
+                "max_median_hold_min": 10080, "allow_unknown_entry": True},
+}
+HARD_KEYS = ("sniper_seconds", "max_sniper_share", "max_bundle_share", "max_wash_share", "funder_cluster_max",
+             "max_insider_share", "fast_dump_seconds", "max_fast_dump_share")
+
+
+def rules(cfg):
+    """Effective scoring thresholds: scoring block + profile overrides (config scoring.profiles.<name> beats PROFILES)."""
+    c = dict(cfg["scoring"])
+    name = str(c.get("profile") or "strict").lower()
+    over = dict(PROFILES.get(name, {}))
+    over.update(((c.get("profiles") or {}).get(name)) or {})
+    for k, v in over.items():
+        if k not in HARD_KEYS:
+            c[k] = v
+    c["profile"] = name if name in PROFILES else "strict"
+    return c
+
+
 def evaluate(s, cfg):
-    c, r = cfg["scoring"], []
+    c, r = rules(cfg), []
     if s["closed"] < c["min_closed_trades"]: r.append(f"closed {s['closed']}<{c['min_closed_trades']}")
     if s["win_rate"] < c["min_win_rate"]: r.append(f"winrate {s['win_rate']:.0%}")
-    if s["pnl_sol"] < c["min_realized_pnl_sol"]: r.append(f"pnl {s['pnl_sol']:.1f}")
+    if s["pnl_sol"] < c["min_realized_pnl_sol"] or s["pnl_sol"] <= 0: r.append(f"pnl {s['pnl_sol']:.1f}")
     if s["median_win_mult"] < c["min_median_win_mult"]: r.append(f"med win {s['median_win_mult']}x")
     if s["top_trade_share"] >= c["max_top_trade_share"]: r.append(f"one-trade {s['top_trade_share']:.0%}")
     me = s["median_entry_min"]
-    if me is None or not (c["min_median_entry_min"] <= me <= c["max_median_entry_min"]): r.append(f"entry {me}m")
+    if (me is None and not c.get("allow_unknown_entry")) or (me is not None and not (c["min_median_entry_min"] <= me <= c["max_median_entry_min"])):
+        r.append(f"entry {me}m")
     if s["sniper_share"] > c["max_sniper_share"]: r.append("sniper")
     mh = s["median_hold_min"]
     if mh is None or not (c["min_median_hold_min"] <= mh <= c["max_median_hold_min"]): r.append(f"hold {mh}m")

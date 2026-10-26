@@ -31,7 +31,7 @@ import json, math, time
 
 from .clients import BudgetExceeded, HeliusError
 from .parse import fee_payer, parse_swaps
-from .util import log, now, short
+from .util import is_excluded, log, now, short
 
 DAY = 86400
 PURPOSE = "deep"
@@ -143,7 +143,7 @@ async def pick_tokens(ctx, done):
     disc = []
     for m, a in found.items():
         p = a["p"]
-        if not p or _fake(p, c):
+        if not p or _fake(p, c) or is_excluded(m, (p.get("baseToken") or {}).get("symbol")):
             continue
         created = (p.get("pairCreatedAt") or 0) / 1000
         mcap = p.get("marketCap") or p.get("fdv") or 0
@@ -297,7 +297,9 @@ async def scan_token(ctx, tk, c, run_left):
         return sym, 0, f"budget guard: {e}", tb.spent(), mode
     now_px = await ctx.dex.price_sol(best) if best else None
     early = extract(txs, mint, creator, c, now_px)
-    if not early and why:
+    if not early:  # always say why (TRUMP used to be skipped with reason None)
+        why = why or (f"no transactions in the {c['window_min']}m launch window ({mode or 'no mode'})" if not txs else
+                      f"{len(txs)} launch-window txs but no parsable early buys (creator / block-0-1 snipers removed)")
         return sym, 0, why, tb.spent(), mode
     db.x("INSERT INTO tokens (mint, symbol, pair_created_at, creator) VALUES (?,?,?,?) ON CONFLICT (mint) DO UPDATE SET "
          "creator=COALESCE(tokens.creator, excluded.creator), symbol=COALESCE(tokens.symbol, excluded.symbol), "

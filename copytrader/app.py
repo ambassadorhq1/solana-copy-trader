@@ -76,6 +76,37 @@ async def daily_summary(ctx):
     await ctx.tg.send(text)
 
 
+STARTUP_SCOUT_STALE_S = 6 * 3600
+
+
+async def scout_job(ctx):
+    """run_scout under ctx.scout_lock; on failure stamp last_scout so we don't re-scout every minute."""
+    db = ctx.db
+    async with ctx.scout_lock:
+        try:
+            return await run_scout(ctx)
+        finally:
+            if (db.kv_get("last_scout") or {}).get("ts", 0) < now() - 60:
+                db.kv_set("last_scout", {"ts": now(), "tokens": 0, "new_candidates": 0, "error": True})
+
+
+def startup_scout(ctx):
+    """On boot: start a background scout if last_scout (DB) is older than 6 h. Respects the budget hard stop.
+    -> the task, or None when skipped."""
+    ls = ctx.db.kv_get("last_scout") or {}
+    if (now() - (ls.get("ts") or 0) < STARTUP_SCOUT_STALE_S or ctx.scout_lock.locked() or not ctx.helius.key
+            or ctx.budget.over_hard_stop()):
+        return None
+    log.info("startup scout: last_scout is stale, starting one in the background")
+
+    async def job():
+        try:
+            await scout_job(ctx)
+        except Exception as e:
+            log.exception("startup scout failed: %s", e)
+    return asyncio.get_running_loop().create_task(job())
+
+
 async def scheduler_tick(ctx):
     cfg, db, today, hour = ctx.cfg, ctx.db, local_day(ctx.cfg), local_hour(ctx.cfg)
     if ctx.budget.over_hard_stop() and db.kv_get("budget_stop") != today[:7]:
@@ -84,12 +115,7 @@ async def scheduler_tick(ctx):
         await ctx.tg.send("⚠️ <b>Helius hard stop</b>\nMonthly credit limit reached: scouting and watching paused. Exits still run.")
     ls = db.kv_get("last_scout") or {}
     if now() - (ls.get("ts") or 0) >= cfg["scout"]["interval_min"] * 60 and not ctx.scout_lock.locked() and ctx.helius.key:
-        async with ctx.scout_lock:
-            try:
-                await run_scout(ctx)
-            finally:  # never re-scout every minute after a failure
-                if (db.kv_get("last_scout") or {}).get("ts", 0) < now() - 60:
-                    db.kv_set("last_scout", {"ts": now(), "tokens": 0, "new_candidates": 0, "error": True})
+        await scout_job(ctx)
     from .winners import format_result, run_winners, wcfg
     wc = wcfg(cfg)
     if (wc["enabled"] and ctx.helius.key and hour >= wc["run_hour"] and db.kv_get("last_winners_day") != today
@@ -168,7 +194,8 @@ def make_app(ctx, start_background=True):
         elif ctx.tg.token:
             app["tg_poll"] = asyncio.create_task(ctx.tg.poll_loop())
         await ctx.watcher.sync()
-        app["tasks"] = [asyncio.create_task(_loop("scheduler", lambda: scheduler_tick(ctx), 60)),
+        st = startup_scout(ctx)  # no scout since boot otherwise: last_scout lives in the DB and survives redeploys
+        app["tasks"] = ([st] if st else []) + [asyncio.create_task(_loop("scheduler", lambda: scheduler_tick(ctx), 60)),
                         asyncio.create_task(_loop("exits", ctx.executor.check_exits, ctx.cfg["execution"]["exit_check_s"])),
                         asyncio.create_task(ctx.watcher.poll_loop())]
         await ctx.tg.send(f"🚀 <b>Copy-trader started</b> · 📄 PAPER · {ctx.watcher.mode}\n/help")

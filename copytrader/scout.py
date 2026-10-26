@@ -1,7 +1,7 @@
 """Scout: recently pumped Solana tokens (Dexscreener) -> early buyers from the mint's oldest txs (Helius gTFA asc)."""
 from .clients import BudgetExceeded, HeliusError
 from .parse import parse_swaps, fee_payer
-from .util import log, now
+from .util import is_excluded, log, now
 
 
 def early_buyers(txs, mint, cfg):
@@ -29,6 +29,8 @@ async def pick_tokens(ctx):
     pairs = await ctx.dex.best_pairs(mints)
     picks, t = [], now()
     for mint, p in pairs.items():
+        if is_excluded(mint, (p.get("baseToken") or {}).get("symbol")):
+            continue
         created = (p.get("pairCreatedAt") or 0) / 1000
         age_h = (t - created) / 3600 if created else 1e9
         pc = p.get("priceChange") or {}

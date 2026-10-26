@@ -17,7 +17,7 @@ import json
 
 from .clients import BudgetExceeded, HeliusError
 from .parse import fee_payer, parse_swaps
-from .util import log, now, short
+from .util import is_excluded, log, now, short
 
 DAY = 86400
 PURPOSE = "winners"
@@ -25,10 +25,11 @@ PURPOSE = "winners"
 
 def wcfg(cfg):
     d = {"enabled": True, "run_hour": 3, "tokens_per_run": 20, "max_age_days": 30, "min_age_h": 24,
-         "min_mcap_usd": 1_000_000, "min_liquidity_usd": 50_000, "search_queries": ["pump", "solana", "meme", "bonk"],
+         "min_mcap_usd": 500_000, "min_liquidity_usd": 25_000, "search_queries": ["pump", "solana", "meme", "bonk"],
          "early_tx_limit": 200, "early_window_min": 60, "max_entry_frac_of_now": 0.2, "sniper_slots": 2,
          "max_buyers_per_token": 25, "min_repeat": 2, "min_realized_mult": 3.0, "min_sold_frac": 0.5,
-         "active_days": 7, "wallets_per_run": 8, "recheck_days": 7}
+         "active_days": 7, "wallets_per_run": 8, "recheck_days": 7,
+         "fallback_min_repeaters": 3, "fallback_top_n": 20}
     d.update(cfg.get("winners") or {})
     return d
 
@@ -61,7 +62,7 @@ async def pick_winners(ctx):
     done = {r["mint"] for r in db.all("SELECT DISTINCT mint FROM winner_early")} | set((db.kv_get("winners_done") or {}).keys())
     keep = []
     for m, p in found.items():
-        if m in done or (p.get("quoteToken") or {}).get("address") == m:
+        if m in done or (p.get("quoteToken") or {}).get("address") == m or is_excluded(m, (p.get("baseToken") or {}).get("symbol")):
             continue
         created = (p.get("pairCreatedAt") or 0) / 1000
         age_h = (t - created) / 3600 if created else 1e9
@@ -120,7 +121,18 @@ def repeaters(db, c):
     return [r["wallet"] for r in sorted(rows, key=lambda r: -r["n"])]
 
 
-async def check_wallet(ctx, addr, c):
+def top_early(db, n, exclude=()):
+    """Fallback when there are too few repeaters: the N earliest-relative / biggest early buyers across winner tokens.
+    Ranked by number of winners they were early on, then by how close to launch they bought, then by SOL size."""
+    rows = db.all("SELECT e.wallet, COUNT(DISTINCT e.mint) AS n, MIN(e.ts - COALESCE(t.pair_created_at, e.ts)) AS d, SUM(e.sol) AS sol "
+                  "FROM winner_early e LEFT JOIN tokens t ON t.mint=e.mint GROUP BY e.wallet")
+    ex = set(exclude)
+    rows = [r for r in rows if r["wallet"] not in ex]
+    rows.sort(key=lambda r: (-(r["n"] or 0), max(r["d"] or 0, 0), -(r["sol"] or 0)))
+    return [r["wallet"] for r in rows[:n]]
+
+
+async def check_wallet(ctx, addr, c, min_wins=None):
     """History fetch (scorer's backfill call) -> (passes, info). Stores swaps; marks the wallet backfilled."""
     from .scorer import store_swaps
     cfg, db, t = ctx.cfg, ctx.db, now()
@@ -135,7 +147,8 @@ async def check_wallet(ctx, addr, c):
         if m is not None and m >= c["min_realized_mult"] and sold >= c["min_sold_frac"]:
             wins.append((r["symbol"] or short(r["mint"]), round(m, 2)))
     active = last >= t - c["active_days"] * DAY
-    return active and len(wins) >= c["min_repeat"], {"active": active, "last_ts": last, "wins": wins}
+    need = c["min_repeat"] if min_wins is None else min_wins
+    return active and len(wins) >= need, {"active": active, "last_ts": last, "wins": wins}
 
 
 async def run_winners(ctx, manual=False):
@@ -182,9 +195,15 @@ async def run_winners(ctx, manual=False):
     checked = db.kv_get("winners_checked") or {}
     reps = repeaters(db, c)
     res["repeaters"] = len(reps)
+    cap, fallback = c["wallets_per_run"], set()
+    if len(reps) < c["fallback_min_repeaters"]:  # too few repeaters: also check the top N early buyers' history
+        extra = top_early(db, c["fallback_top_n"], exclude=reps)
+        fallback, reps = set(extra), reps + extra
+        cap = max(cap, len(reps))
+        res["fallback"] = len(fallback)
     from .scorer import score_wallet
     for addr in reps:
-        if res["checked"] >= c["wallets_per_run"] or res["stopped"]:
+        if res["checked"] >= cap or res["stopped"]:
             break
         w = db.one("SELECT * FROM wallets WHERE address=?", (addr,))
         if w and (w["status"] in ("watch", "qualified") or (w.get("scored_at") or 0) > now() - c["recheck_days"] * DAY):
@@ -192,7 +211,7 @@ async def run_winners(ctx, manual=False):
         if (checked.get(addr) or 0) > now() - c["recheck_days"] * DAY:
             continue
         try:
-            ok, info = await check_wallet(ctx, addr, c)
+            ok, info = await check_wallet(ctx, addr, c, min_wins=1 if addr in fallback else None)
         except BudgetExceeded as e:
             res["stopped"] = f"budget: {e}"; break
         except HeliusError as e:
@@ -228,8 +247,8 @@ def format_result(res):
         return f"🏆 <b>Winners scout</b>\nSkipped: {esc(res['stopped'])}"
     st = list(res["scored"].values())
     rows = [["Winner tokens", str(res["tokens"])], ["Early buyers", str(res["early"])],
-            ["Repeaters", str(res["repeaters"])], ["History checked", str(res["checked"])],
-            ["≥3x + active", str(res["passed"])],
+            ["Repeaters", str(res["repeaters"])], ["Fallback early", str(res.get("fallback", 0))], ["History checked", str(res["checked"])],
+            ["Passed + active", str(res["passed"])],
             ["→ watch", str(st.count("watch"))], ["→ bench", str(st.count("qualified"))],
             ["→ rejected", str(st.count("rejected"))]]
     out = "🏆 <b>Winners scout</b> · 📄 PAPER\n" + table(rows, "lr")

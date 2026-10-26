@@ -9,6 +9,22 @@ log = logging.getLogger("copytrader")
 WSOL = "So11111111111111111111111111111111111111112"
 STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}  # USDT
+# Never scouted as "winners": SOL / wSOL, SOL liquid-staking tokens and large-cap stables (they top every mcap ranking).
+EXCLUDED_MINTS = {WSOL, "11111111111111111111111111111111"} | STABLES | {
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # jitoSOL
+    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",   # bSOL
+    "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",  # PYUSD
+    "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",   # USDS
+}
+EXCLUDED_SYMBOLS = {"SOL", "WSOL", "MSOL", "JITOSOL", "BSOL", "JUPSOL", "INF", "USDC", "USDT", "PYUSD", "USDS", "USDE", "DAI",
+                    "FDUSD", "TUSD", "USDH", "UXD", "EURC", "USD1"}
+
+
+def is_excluded(mint, symbol=None):
+    """SOL-like / stablecoin tokens: excluded from every discovery path (scout, winners, deep)."""
+    sym = (symbol or "").strip().upper().lstrip("$")
+    return mint in EXCLUDED_MINTS or sym in EXCLUDED_SYMBOLS
 
 
 def load_config(path=None):

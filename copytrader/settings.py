@@ -16,13 +16,16 @@ KNOBS = {
     "cluster_sol":     (("clusters", "min_total_sol"), "float", 0.1, 10000, "cluster: min combined SOL"),
     "cluster_age_h":   (("clusters", "max_token_age_h"), "float", 1, 168, "cluster: max token age, hours"),
     "exit_mode":       (("execution", "default_exit"), "choice", None, None, "new trades: ladder (TP ladder) or follow (sell when the wallet sells)"),
+    "scoring_profile": (("scoring", "profile"), "choice", None, None, "wallet scoring: relaxed (paper default) or strict"),
 }
-CHOICES = {"exit_mode": {"ladder": "ladder", "default": "ladder", "tp": "ladder", "follow": "follow", "wallet": "follow"}}
+CHOICES = {"exit_mode": {"ladder": "ladder", "default": "ladder", "tp": "ladder", "follow": "follow", "wallet": "follow"},
+           "scoring_profile": {"relaxed": "relaxed", "loose": "relaxed", "strict": "strict"}}
 ALIASES = {"per_trade_sol": "trade_sol", "size": "trade_sol", "sl": "stop_loss", "stop": "stop_loss", "time_stop": "time_stop_h",
            "ladder": "tp_ladder", "tp": "tp_ladder", "clusters.min_wallets": "cluster_wallets",
            "clusters.window_min": "cluster_window", "clusters.min_total_sol": "cluster_sol",
            "clusters.max_token_age_h": "cluster_age_h", "execution.per_trade_sol": "trade_sol",
-           "execution.stop_loss_mult": "stop_loss", "execution.time_stop_h": "time_stop_h", "execution.tp_ladder": "tp_ladder"}
+           "execution.stop_loss_mult": "stop_loss", "execution.time_stop_h": "time_stop_h", "execution.tp_ladder": "tp_ladder",
+           "profile": "scoring_profile", "scoring.profile": "scoring_profile", "default_exit": "exit_mode"}
 FORBIDDEN = {"mode", "live", "live_trading", "private_key", "wallet_key"}
 
 
@@ -149,7 +152,7 @@ def show(ctx, key):
         from .tgbot import ladder
         return ladder(config_ladder(ctx.cfg["execution"]))
     if kind == "choice":
-        return v or "ladder"
+        return v or ("relaxed" if key == "scoring_profile" else "ladder")
     if kind == "loss":
         return f"-{(1 - float(v)) * 100:.1f}%"
     if key == "trade_sol":

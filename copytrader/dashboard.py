@@ -1,7 +1,9 @@
-"""Read-only web dashboard: GET /dashboard (one self-contained HTML page) + GET /api/summary (JSON, cached ~10 s).
+"""Web dashboard: GET /dashboard (one self-contained HTML page) + GET /api/summary (JSON, cached ~10 s), plus two
+key-protected writes: POST /api/settings (same whitelist + validation as Telegram /set, see settings.py) and
+POST /api/action (pause / resume / scout / deep). Live mode can't be enabled from here: paper stays forced.
 
 Auth: the key is env DASHBOARD_KEY, else TG_WEBHOOK_SECRET (ctx.tg_secret). Pass ?key=... once; /dashboard then sets an
-HttpOnly cookie. Constant-time compare, 401 on a missing or bad key. No write actions exist here.
+HttpOnly SameSite=Lax cookie. Constant-time compare, 401 on a missing or bad key. POSTs must be application/json.
 Exit stats come from the cached daily recommendation (kv 'exit_reco'); hit rates are computed in a background thread at
 most once per new recommendation (or per reco_max_age_h), never inside a request.
 """
@@ -142,12 +144,141 @@ def build_summary(ctx):
         "pnl": {"realized_total": float(f["total"] or 0), "realized_today": float(f["today"] or 0), "unrealized": unreal,
                 "closed": n, "wins": wins, "win_rate": wins / n if n else None, "closed_today": int(c["n_today"] or 0)},
         "open_positions": opens, "closed_trades": closed, "watchlist": wl,
-        "exits": _exits(ctx), "clusters": recent(db, 10),
+        "exits": _exits(ctx), "clusters": recent(db, 10), "settings": current_settings(ctx),
     }
+
+
+# ---------------------------------------------------------------- settings + actions (writes)
+FORM_KEYS = ("trade_sol", "stop_loss", "time_stop_h", "tp_ladder", "exit_mode", "cluster_window", "cluster_wallets",
+             "cluster_age_h", "scoring_profile")
+
+
+def current_settings(ctx):
+    from .exits import config_ladder
+    from .settings import _get, apply, overrides, trade_cap
+    if not hasattr(ctx, "cfg_base"):
+        apply(ctx)
+    e, cl, sc = ctx.cfg["execution"], ctx.cfg.get("clusters") or {}, ctx.cfg["scoring"]
+    lad = ",".join(f"{t['frac'] * 100:g}@{t['mult']:g}" for t in config_ladder(e))
+    return {"trade_sol": float(e["per_trade_sol"]), "trade_cap": trade_cap(ctx.cfg_base),
+            "stop_loss": round((1 - float(e["stop_loss_mult"])) * 100, 1), "time_stop_h": e["time_stop_h"], "tp_ladder": lad,
+            "exit_mode": "follow" if e.get("default_exit") == "follow" else "tp",
+            "cluster_window": cl.get("window_min"), "cluster_wallets": cl.get("min_wallets"), "cluster_age_h": cl.get("max_token_age_h"),
+            "scoring_profile": sc.get("profile") or "strict", "overrides": sorted(overrides(ctx)), "mode": "paper"}
+
+
+def save_settings(ctx, body):
+    """-> (status, payload). All-or-nothing: every field is validated (settings.validate) before any is saved."""
+    from .settings import ALIASES, FORBIDDEN, KNOBS, apply, set_value, validate
+    if not isinstance(body, dict) or not body:
+        return 400, {"ok": False, "error": "send a JSON object of settings"}
+    for k, v in body.items():
+        kl = str(k).strip().lower()
+        if kl in FORBIDDEN or "live" in kl or kl.split(".")[-1] == "mode" or str(v).strip().lower() == "live":
+            return 400, {"ok": False, "error": "Paper mode is forced. Live trading can't be enabled from the dashboard."}
+    if not hasattr(ctx, "cfg_base"):
+        apply(ctx)
+    errors, todo = {}, []
+    for k, v in body.items():
+        key = ALIASES.get(str(k).strip().lower(), str(k).strip().lower())
+        if key not in KNOBS:
+            errors[k] = "unknown setting"; continue
+        raw = str(v).strip()
+        if raw == "":
+            continue
+        if raw.lower() not in ("default", "reset", "config"):
+            try:
+                validate(key, raw, ctx.cfg_base)
+            except ValueError as e:
+                errors[k] = str(e); continue
+        todo.append((key, raw))
+    if errors:
+        return 400, {"ok": False, "errors": errors}
+    saved = {}
+    for key, raw in todo:
+        ok, msg = set_value(ctx, key, raw)
+        if not ok:  # validated above; keep going but report
+            errors[key] = msg
+        else:
+            saved[key] = msg
+    return (200 if not errors else 400), {"ok": not errors, "saved": saved, "errors": errors, "settings": current_settings(ctx)}
+
+
+ACTIONS = ("pause", "resume", "scout", "deep")
+
+
+def do_action(ctx, action):
+    """-> (status, payload). scout / deep start in the background under ctx.scout_lock; results also go to Telegram."""
+    db = ctx.db
+    if action == "pause":
+        db.kv_set("paused", True); return 200, {"ok": True, "paused": True, "message": "Paused: no new paper entries. Exits keep running."}
+    if action == "resume":
+        db.kv_set("paused", False); return 200, {"ok": True, "paused": False, "message": "Resumed: new paper entries are on."}
+    if action not in ("scout", "deep"):
+        return 400, {"ok": False, "error": f"unknown action; use one of {', '.join(ACTIONS)}"}
+    if ctx.scout_lock.locked():
+        return 409, {"ok": False, "error": "A scout is already running. Try again in a few minutes."}
+    if not ctx.helius.key:
+        return 400, {"ok": False, "error": "HELIUS_API_KEY is not set."}
+    if ctx.budget.over_hard_stop():
+        return 409, {"ok": False, "error": "Monthly Helius credit hard stop reached: scouting is paused."}
+
+    async def job():
+        try:
+            if action == "scout":
+                from .app import scout_job
+                res = await scout_job(ctx)
+                await ctx.tg.send(f"🔍 <b>Scout</b> (dashboard): {res.get('tokens', 0)} tokens, "
+                                  f"{res.get('candidates', 0)} new candidates, {res.get('scored', 0)} scored")
+            else:
+                from .deep import format_result, run_deep
+                async with ctx.scout_lock:
+                    res = await run_deep(ctx, manual=True)
+                await ctx.tg.send(format_result(res))
+        except Exception as e:
+            log.exception("dashboard %s failed: %s", action, e)
+    st = ctx.__dict__.setdefault("_dash", {})
+    st["action_task"] = asyncio.get_running_loop().create_task(job())
+    return 202, {"ok": True, "started": action,
+                 "message": "Scout started; the result lands in Telegram." if action == "scout"
+                 else "Deep scout started (slow, credit-capped); the result lands in Telegram."}
 
 
 def add_routes(app, ctx):
     cache = ctx.__dict__.setdefault("_dash", {}).setdefault("summary_cache", {"ts": 0.0, "body": None})
+
+    async def _body(req):
+        if not req.content_type.startswith("application/json"):
+            return None
+        try:
+            return await req.json()
+        except Exception:
+            return None
+
+    def _out(status, payload):
+        cache["body"] = None  # next summary reflects the change
+        return web.json_response(payload, status=status, headers=HDRS, dumps=lambda o: json.dumps(o, default=_json))
+
+    async def post_settings(req):
+        if not _authorized(ctx, req):
+            return _deny()
+        body = await _body(req)
+        if body is None:
+            return _out(400, {"ok": False, "error": "send application/json"})
+        return _out(*save_settings(ctx, body))
+
+    async def get_settings(req):
+        if not _authorized(ctx, req):
+            return _deny()
+        return _out(200, current_settings(ctx))
+
+    async def post_action(req):
+        if not _authorized(ctx, req):
+            return _deny()
+        body = await _body(req)
+        if not isinstance(body, dict):
+            return _out(400, {"ok": False, "error": "send application/json {\"action\": ...}"})
+        return _out(*do_action(ctx, str(body.get("action", "")).strip().lower()))
 
     async def summary(req):
         if not _authorized(ctx, req):
@@ -169,6 +300,9 @@ def add_routes(app, ctx):
 
     app.router.add_get("/dashboard", page)
     app.router.add_get("/api/summary", summary)
+    app.router.add_get("/api/settings", get_settings)
+    app.router.add_post("/api/settings", post_settings)
+    app.router.add_post("/api/action", post_action)
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -198,16 +332,38 @@ tr:last-child td{border-bottom:0}.l{text-align:left!important}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;overflow-x:auto;font-size:12px;margin:8px 0 0}
 #err{display:none;background:#3d1d20;border:1px solid #6e2b30;color:#ffb3b0;padding:8px 10px;border-radius:8px;margin-top:8px}
 footer{color:var(--mute);font-size:12px;text-align:center;margin:18px 0 8px}
+.btns{display:flex;flex-wrap:wrap;gap:8px}
+button{font:inherit;color:var(--fg);background:#21262d;border:1px solid var(--line);border-radius:8px;padding:10px 14px;min-height:44px;cursor:pointer}
+button.pri{background:#238636;border-color:#2ea043;font-weight:600}button:disabled{opacity:.5}
+.form{display:grid;grid-template-columns:1fr;gap:10px}@media(min-width:640px){.form{grid-template-columns:1fr 1fr}}
+.form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute)}
+.form input,.form select{font:16px/1.3 inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:44px;width:100%}
+.msg{margin-top:8px;font-size:13px;min-height:1em}.ok{color:var(--g)}.bad{color:var(--r)}
 </style></head><body><main>
 <div class="bar" id="bar"><span class="pill paper">📄 PAPER</span><span class="pill mute">loading…</span></div>
 <div id="err"></div>
+<h2>Controls</h2><div class="card"><div class="btns">
+<button id="b-pause" data-a="pause">⏸ Pause</button><button data-a="scout">🔍 Run scout</button><button data-a="deep">🔭 Run deep scout</button>
+</div><div class="msg" id="amsg"></div></div>
+<h2>Settings · 📄 paper only</h2><div class="card"><form id="sf" class="form" autocomplete="off">
+<label>Trade size, SOL <span id="capnote"></span><input name="trade_sol" type="number" step="0.001" min="0.01" inputmode="decimal"></label>
+<label>Stop loss, % loss<input name="stop_loss" type="number" step="1" min="5" max="95" inputmode="numeric"></label>
+<label>Time stop, hours<input name="time_stop_h" type="number" step="1" min="1" max="168" inputmode="numeric"></label>
+<label>TP ladder (pct@mult)<input name="tp_ladder" type="text" placeholder="50@2,50@3"></label>
+<label>Exit mode<select name="exit_mode"><option value="tp">TP ladder</option><option value="follow">Follow wallet</option></select></label>
+<label>Cluster window, min<input name="cluster_window" type="number" step="1" min="5" max="1440" inputmode="numeric"></label>
+<label>Cluster min wallets<input name="cluster_wallets" type="number" step="1" min="2" max="25" inputmode="numeric"></label>
+<label>Max token age, hours<input name="cluster_age_h" type="number" step="1" min="1" max="168" inputmode="numeric"></label>
+<label>Scoring profile<select name="scoring_profile"><option value="relaxed">Relaxed (paper default)</option><option value="strict">Strict</option></select></label>
+<div><button class="pri" type="submit" id="save" style="width:100%">Save settings</button></div>
+</form><div class="msg" id="smsg"></div></div>
 <h2>PnL</h2><div class="cards" id="cards"></div>
 <h2>Open positions</h2><div class="wrap" id="open"></div>
 <h2>Smart-money clusters</h2><div class="wrap" id="clusters"></div>
 <h2>Closed trades · last 20</h2><div class="wrap" id="closed"></div>
 <h2>Watchlist</h2><div class="wrap" id="wl"></div>
 <h2>Exits</h2><div class="card" id="exits"></div>
-<footer id="foot">Read-only · refreshes every 30 s</footer>
+<footer id="foot">Refreshes every 30 s</footer>
 </main><script>
 (function(){
 var K=new URLSearchParams(location.search).get("key");
@@ -227,8 +383,30 @@ function tbl(head,rows,empty){if(!rows.length)return'<div class="empty">'+e(empt
  return"<table><thead><tr>"+head.map(function(h){return"<th>"+e(h)+"</th>"}).join("")+"</tr></thead><tbody>"+
  rows.map(function(r){return"<tr>"+r.map(function(c){return"<td"+(c&&c.c?' class="'+c.c+'"':"")+">"+(c&&c.h!=null?c.h:e(c&&c.t!=null?c.t:c))+"</td>"}).join("")+"</tr>"}).join("")+"</tbody></table>"}
 function card(k,v,c){return'<div class="card"><div class="k">'+e(k)+'</div><div class="v '+(c||"")+'">'+e(v)+"</div></div>"}
+function q(){return K?"?key="+encodeURIComponent(K):""}
+var S0=null,dirty=false;
+function fill(st){if(!st||dirty)return;S0=st;var f=$("sf");FK.forEach(function(k){if(f[k]!=null&&st[k]!=null)f[k].value=st[k]});
+ $("capnote").textContent="(max "+n(st.trade_cap,3)+")";f.trade_sol.max=st.trade_cap}
+var FK=["trade_sol","stop_loss","time_stop_h","tp_ladder","exit_mode","cluster_window","cluster_wallets","cluster_age_h","scoring_profile"];
+function post(u,b){return fetch(u+q(),{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})
+ .then(function(r){if(r.status==401)throw new Error("Unauthorized: open /dashboard?key=… again");return r.json().then(function(j){j._s=r.status;return j})})}
+function say(id,t,ok){var m=$(id);m.textContent=t;m.className="msg "+(ok?"ok":"bad")}
+$("sf").addEventListener("input",function(){dirty=true});
+$("sf").addEventListener("submit",function(ev){ev.preventDefault();var f=$("sf"),b={};
+ FK.forEach(function(k){var v=String(f[k].value).trim();if(!S0||String(S0[k])!==v)b[k]=v});
+ if(f.trade_sol.value&&S0&&+f.trade_sol.value>S0.trade_cap){say("smsg","Trade size is capped at "+n(S0.trade_cap,3)+" SOL",false);return}
+ if(!Object.keys(b).length){say("smsg","Nothing changed",true);return}
+ $("save").disabled=true;say("smsg","Saving…",true);
+ post("/api/settings",b).then(function(j){if(j.ok){dirty=false;fill(j.settings);say("smsg","✅ Saved: "+Object.values(j.saved).join(" · "),true);load()}
+  else say("smsg","⚠️ "+(j.error||Object.keys(j.errors||{}).map(function(k){return k+": "+j.errors[k]}).join(" · ")),false)})
+ .catch(function(e){say("smsg",e.message,false)}).then(function(){$("save").disabled=false})});
+Array.prototype.forEach.call(document.querySelectorAll("[data-a]"),function(btn){btn.addEventListener("click",function(){
+ var a=btn.getAttribute("data-a");if((a=="scout"||a=="deep")&&!confirm(a=="deep"?"Run the deep scout? It is slow and spends Helius credits.":"Run the scout now? It spends Helius credits."))return;
+ btn.disabled=true;post("/api/action",{action:a}).then(function(j){say("amsg",(j.ok?"✅ ":"⚠️ ")+(j.message||j.error||""),j.ok);if(j.ok)load()})
+ .catch(function(e){say("amsg",e.message,false)}).then(function(){btn.disabled=false})})});
 function render(d){
- var s=d.status,p=d.pnl,x=d.exits;
+ var s=d.status,p=d.pnl,x=d.exits;fill(d.settings);
+ var pb=$("b-pause");pb.setAttribute("data-a",s.paused?"resume":"pause");pb.textContent=s.paused?"▶️ Resume":"⏸ Pause";
  $("bar").innerHTML='<span class="pill paper">📄 PAPER</span>'+
   (s.paused?'<span class="pill pause">⏸ paused</span>':'<span class="pill run">▶ running</span>')+
   '<span class="pill">watcher: '+e(s.watcher)+'</span><span class="pill">up '+dur(s.uptime_s)+'</span>'+
@@ -259,10 +437,10 @@ function render(d){
   "<br>current "+e(x.current_ladder)+": "+mx(g.current_mean)+" · follow-only "+mx(g.follow_only_mean)+"</div><pre>"+e(g.config)+"</pre>";}
  else{h+='<div class="small" style="margin-top:8px">No ladder suggested'+(x.reason?": "+e(x.reason):"")+'</div><div class="small mute">Current: '+e(x.current_ladder)+"</div>";}
  $("exits").innerHTML=h;
- $("foot").textContent="Read-only · updated "+new Date(d.ts*1000).toLocaleTimeString()+" · refreshes every 30 s";
+ $("foot").textContent="Updated "+new Date(d.ts*1000).toLocaleTimeString()+" · refreshes every 30 s";
 }
 function load(){
- var u="/api/summary"+(K?"?key="+encodeURIComponent(K):"");
+ var u="/api/summary"+q();
  fetch(u,{credentials:"same-origin",cache:"no-store"}).then(function(r){
   if(r.status==401)throw new Error("Unauthorized: open /dashboard?key=… again");
   if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(d){$("err").style.display="none";render(d)})
