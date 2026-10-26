@@ -1,0 +1,107 @@
+# Solana smart-wallet copy-trader v1 — PAPER mode. Every rule below is tunable.
+mode: paper                 # paper only. "live" is a disabled stub and the app refuses to start with it.
+timezone: Africa/Lagos      # day boundaries (daily cap, daily PnL) + scheduled jobs
+daily_summary_hour: 21      # local hour for the Telegram daily PnL summary
+
+budget:                     # Helius free = 1M credits/month. Our own meter; the Helius dashboard is the truth.
+  helius_monthly_credits: 900000   # 10% headroom under 1M
+  hard_stop_frac: 0.97             # above this share of the monthly budget: scouting stops, webhook is removed
+  scout_share: 0.35                # max share of the daily allowance scout + backfill may spend
+  score_share: 0.10                # max share for the daily rescore of watchlist wallets
+
+rate_limits:
+  helius_rps: 8             # free plan 10 RPS
+  jupiter_rps: 0.45         # keyless 0.5 RPS (30/min sliding window)
+  dexscreener_rps: 0.9      # boosts/profiles endpoints are 60/min
+
+endpoints:
+  helius_rpc: https://mainnet.helius-rpc.com/
+  helius_webhooks: https://api-mainnet.helius-rpc.com/v0/webhooks
+  jupiter_quote: https://api.jup.ag/swap/v1/quote
+  dexscreener: https://api.dexscreener.com
+
+scout:                      # candidates = early buyers of recently pumped tokens
+  interval_min: 120
+  tokens_per_run: 5
+  min_pair_age_h: 1
+  max_pair_age_h: 72
+  min_change_pct: 300       # max(h6, h24) price change %
+  min_liquidity_usd: 20000
+  early_tx_limit: 200       # oldest txs of the mint to read (20 credits)
+  early_window_min: 30      # buyers within first N minutes of launch
+  sniper_slots: 2           # skip buys in launch slot + next N-1 slots (block 0/1 snipers)
+  max_buyers_per_token: 12
+  backfill_per_run: 6       # candidate wallets backfilled + scored per run
+  backfill_limit: 500       # txs per page (50 credits)
+  backfill_pages: 1
+
+scoring:                    # docs/architecture.md "Wallet scoring (v1)"
+  window_days: 30
+  min_closed_trades: 20
+  min_win_rate: 0.55
+  win_min_gain: 0.30        # win = realized >= +30%
+  min_realized_pnl_sol: 50
+  min_median_win_mult: 2.0
+  max_top_trade_share: 0.5  # profit not from one lucky trade
+  min_median_entry_min: 0   # median buy delay after pool/launch, minutes
+  max_median_entry_min: 30
+  sniper_seconds: 3         # buys this close to launch count as sniper buys
+  max_sniper_share: 0.2
+  min_median_hold_min: 10
+  max_median_hold_min: 1440
+  max_insider_share: 0.2    # tokens received without buying (transfers in / pre-launch supply)
+  max_bundle_share: 0.3     # buys sharing slot+mint with another candidate wallet
+  fast_dump_seconds: 60
+  max_fast_dump_share: 0.3  # buy -> pump -> dump within seconds
+  max_wash_share: 0.2       # sub-minute round trips at ~1.0x
+  funder_cluster_max: 3     # >= N candidate wallets with the same funder = cluster, exclude
+  closed_sold_frac: 0.9     # position counts as closed when >= 90% sold
+  max_watch: 25
+  demote_loss_streak: 5
+  demote_on_rule_fail: true
+  rescore_hour: 4           # local hour for the daily re-score / decay
+
+watch:
+  mode: webhook             # webhook (needs PUBLIC_URL or RENDER_EXTERNAL_URL) | poll
+  poll_daily_credits: 12000 # poll mode: interval auto-stretches to stay inside this
+  min_poll_interval_s: 60
+  min_wallet_buy_sol: 0.2   # ignore dust buys by the watched wallet
+  max_signal_age_s: 180     # ignore buys older than this when they reach us
+
+execution:
+  per_trade_sol: 0.1
+  daily_cap_sol: 1.0
+  max_open: 5
+  slippage_bps: 1500
+  sim_slippage_bps: 100     # haircut on Jupiter outAmount for simulated fills
+  sim_fee_sol: 0.0005       # per simulated tx (base + priority fee)
+  max_price_impact: 0.15
+  max_entry_vs_wallet: 1.5  # skip if our price > 1.5x the wallet's entry
+  min_liquidity_usd: 10000
+  require_authorities_revoked: true
+  max_roundtrip_loss: 0.30  # honeypot check: immediate sell quote must return >= 70%
+  exit_check_s: 30
+  tp1_mult: 2.0
+  tp1_frac: 0.5
+  tp2_mult: 3.0
+  # tp_ladder:              # optional; overrides tp1/tp2. frac = share of the INITIAL position; a sum < 1 leaves a runner
+  #   - {mult: 2, frac: 0.5}  # (exited by follow / stop-loss / time stop). Paste the one /exits suggests here.
+  #   - {mult: 5, frac: 0.5}
+  stop_loss_mult: 0.5       # -50%
+  time_stop_h: 24
+  fallback_haircut: 0.15    # if Jupiter has no sell route, value at Dexscreener price minus this
+
+exits:                      # exit analytics (/exits, daily line) + optional auto-tuned TP ladder
+  entry_delay_slippage: 0.15  # our simulated entry = wallet's first-buy price x (1 + this)
+  peak_window_h: 24         # peak after our entry is measured inside this window
+  hit_levels: [2, 3, 5, 10, 20, 50, 100]
+  ladder_levels: [1.5, 2, 3, 5, 10, 20, 50, 100]   # TP levels the recommender may use
+  ladder_fracs: [0.25, 0.5, 0.75, 1.0]              # tranche sizes it may use
+  max_tranches: 3
+  min_first_hit: 0.60       # safety bias: first tranche must be reached by >= 60% of trades after our entry
+  min_level_hits: 3         # every level used must have been reached by >= N trades (no fitting to 1-2 moonshots)
+  min_cases: 15             # no recommendation below this many trades with price data
+  auto_tune_exits: false    # true: NEW paper trades use the recommended ladder (open ones keep theirs)...
+  auto_tune_min_paper_trades: 30   # ...but only after this many closed paper trades
+  reco_max_age_h: 26        # cached recommendation is recomputed when older (normally refreshed by the daily summary)
+  sample_retention_days: 30 # our 30 s price samples are pruned after this

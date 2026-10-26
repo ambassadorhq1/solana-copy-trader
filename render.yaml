@@ -1,0 +1,30 @@
+# Render Blueprint — one free web service. Postgres is external (Neon/Supabase free) because
+# Render's free Postgres expires 30 days after creation. Secrets are sync:false (entered in the dashboard).
+services:
+  - type: web
+    name: sol-copytrader
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DATABASE_URL       # postgresql://user:pass@host/db?sslmode=require
+        sync: false
+      - key: HELIUS_WEBHOOK_SECRET
+        generateValue: true
+      - key: TG_WEBHOOK_SECRET
+        generateValue: true
+      - key: LOG_LEVEL
+        value: INFO
+      # RENDER_EXTERNAL_URL is set by Render automatically -> webhook mode for Helius + Telegram.
+      # Optional: JUP_API_KEY (free Jupiter key, 1 RPS instead of keyless 0.5 RPS).
