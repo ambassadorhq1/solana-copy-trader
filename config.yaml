@@ -25,10 +25,10 @@ endpoints:
 scout:                      # candidates = early buyers of recently pumped tokens
   interval_min: 120
   tokens_per_run: 5
-  min_pair_age_h: 1
-  max_pair_age_h: 72
-  min_change_pct: 300       # max(h6, h24) price change %
-  min_liquidity_usd: 20000
+  min_pair_age_h: 0.5       # loosened 2026-10-26 (was 1 / 72 h / 300% / $20k): too few picks
+  max_pair_age_h: 120
+  min_change_pct: 150       # max(h6, h24) price change %
+  min_liquidity_usd: 10000
   early_tx_limit: 200       # oldest txs of the mint to read (20 credits)
   early_window_min: 30      # buyers within first N minutes of launch
   sniper_slots: 2           # skip buys in launch slot + next N-1 slots (block 0/1 snipers)
@@ -84,6 +84,11 @@ scout:                      # candidates = early buyers of recently pumped token
     insider_score_bonus: 100  # ranks 🎯 wallets first
 
 scoring:                    # docs/architecture.md "Wallet scoring (v1)"
+  profile: relaxed          # relaxed (paper default) | strict (the thresholds below as written). Telegram: /set scoring_profile strict
+  profiles:                 # relaxed only loosens performance rules; sniper / dev / bundler / funder / wash / insider filters never change
+    relaxed: {min_closed_trades: 3, min_win_rate: 0.40, min_realized_pnl_sol: 0, min_median_win_mult: 1.5,
+              max_top_trade_share: 0.8, max_median_entry_min: 240, min_median_hold_min: 1, max_median_hold_min: 10080,
+              allow_unknown_entry: true}
   window_days: 30
   min_closed_trades: 20
   min_win_rate: 0.55
@@ -172,8 +177,8 @@ winners:                    # winners backfill scout: seed candidates from big r
   tokens_per_run: 20        # new winner tokens per run (each token is processed once)
   max_age_days: 30          # pair created within the last N days ...
   min_age_h: 24             # ... and at least this old (so early buyers had time to sell)
-  min_mcap_usd: 1000000
-  min_liquidity_usd: 50000
+  min_mcap_usd: 500000      # loosened 2026-10-26 (was 1M / 50k). SOL, wSOL, LSTs and stables are always excluded
+  min_liquidity_usd: 25000
   search_queries: [pump, solana, meme, bonk]   # free Dexscreener /latest/dex/search words (plus boosts/profiles/scouted mints)
   early_tx_limit: 200       # oldest txs of the mint (20 credits)
   early_window_min: 60      # early = bought within N min of the first tx ...
@@ -186,3 +191,5 @@ winners:                    # winners backfill scout: seed candidates from big r
   active_days: 7            # must have a swap in the last N days
   wallets_per_run: 8        # history fetches per run (50 credits each)
   recheck_days: 7           # don't re-fetch a wallet that failed within N days
+  fallback_min_repeaters: 3 # fewer repeaters than this -> also check history of the top N early buyers ...
+  fallback_top_n: 20        # ... (1 realized win needed instead of min_repeat; all scorer filters still apply; budget-capped)
