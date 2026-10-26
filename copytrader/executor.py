@@ -2,6 +2,7 @@
 import asyncio, json
 
 from .exits import config_ladder, entry_ladder, fmt_ladder
+from .tgbot import esc, ladder, mark, mult, px, sol, tok
 from .util import WSOL, log, now, short, day_start_ts
 
 EXIT_MODES = ("default", "follow", "2x", "3x", "now")
@@ -34,6 +35,12 @@ class PaperExecutor:
                 await self._buy(s)
             elif s["side"] == "sell":
                 await self._follow_sell(s)
+        if s["side"] == "buy":  # smart-money cluster alert (alert only, never buys); outside the lock
+            try:
+                from .clusters import on_buy
+                await on_buy(self.ctx, s)
+            except Exception as e:
+                log.exception("cluster check failed: %s", e)
 
     async def _buy(self, s):
         c, ctx = self.c, self.ctx
@@ -77,24 +84,27 @@ class PaperExecutor:
         if not back or int(back["outAmount"]) / 1e9 < c["per_trade_sol"] * (1 - c["max_roundtrip_loss"]):
             return self.skip(s, "sell simulation failed (honeypot / no exit liquidity)")
         sym = ((pair or {}).get("baseToken") or {}).get("symbol") or short(s["mint"])
-        ladder, lsrc = await entry_ladder(ctx)  # fixed for this trade's life; auto-tune only affects new trades
+        ladder_, lsrc = await entry_ladder(ctx)  # fixed for this trade's life; auto-tune only affects new trades
         pid = self.db.insert("INSERT INTO positions (mint, symbol, wallet, opened_ts, sol_in, tokens_init, tokens_left, decimals, "
                              "entry_price, wallet_price, last_price, tp_ladder) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (s["mint"], sym, s["wallet"], now(), cost, out, out, dec, our_px, wallet_px, our_px, json.dumps(ladder)))
+                             (s["mint"], sym, s["wallet"], now(), cost, out, out, dec, our_px, wallet_px, our_px, json.dumps(ladder_)))
         self.db.x("INSERT INTO price_samples (mint, ts, price) VALUES (?,?,?)", (s["mint"], now(), our_px))
         self.db.x("INSERT INTO fills (position_id, ts, side, sol, tokens, reason, source) VALUES (?,?,?,?,?,?,?)",
                   (pid, now(), "buy", cost, out, f"copy {short(s['wallet'])}", "jupiter"))
         await ctx.watcher.sync()
-        await ctx.tg.send(f"🟢 PAPER BUY #{pid} {sym}\n{cost:.4f} SOL @ {our_px:.3e} SOL "
-                          f"(wallet {short(s['wallet'])} paid {wallet_px:.3e}, {s['sol']:.2f} SOL)\n"
-                          f"liq ${liq:,.0f} · exits: follow + {fmt_ladder(ladder)} [{lsrc}], SL -50%, 24h\n"
-                          f"/exit {pid} follow|2x|3x|now")
+        from .deep import is_insider
+        tag = " · 🎯 insider-likely" if is_insider(self.db, s["wallet"]) else ""
+        await ctx.tg.send(f"📄 <b>PAPER BUY #{pid}</b> · {esc(tok(sym, s['mint']))}{tag}\n"
+                          f"{sol(cost, False)} SOL @ <code>{px(our_px)}</code> · wallet {esc(short(s['wallet']))} paid "
+                          f"<code>{px(wallet_px)}</code> ({sol(s['sol'], False)} SOL)\n"
+                          f"Liq ${liq:,.0f} · TP {esc(ladder(ladder_))} [{esc(lsrc)}]\n"
+                          f"SL −50% · 24h stop · <code>/exit {pid} follow|2x|3x|now</code>")
 
     async def _follow_sell(self, s):
         for p in self.db.all("SELECT * FROM positions WHERE status='open' AND wallet=? AND mint=? AND exit_mode IN ('default','follow')",
                              (s["wallet"], s["mint"])):
             pct = min(1.0, s["tokens"] / s["pre_tokens"]) if s["pre_tokens"] else 1.0
-            await self.sell(p, 1.0 if pct >= 0.98 else pct, f"follow: wallet sold {pct:.0%}")
+            await self.sell(p, 1.0 if pct >= 0.98 else pct, f"follow: wallet sold {pct * 100:.1f}%")
 
     # ---------- exits ----------
     async def sell(self, p, frac, reason):
@@ -104,26 +114,28 @@ class PaperExecutor:
             return
         q = await ctx.jup.quote(p["mint"], WSOL, amount, c["slippage_bps"])
         if q:
-            sol = int(q["outAmount"]) * (1 - c["sim_slippage_bps"] / 1e4) / 1e9 - c["sim_fee_sol"]
+            sol_ = int(q["outAmount"]) * (1 - c["sim_slippage_bps"] / 1e4) / 1e9 - c["sim_fee_sol"]
             src = "jupiter"
         else:  # no route: value at Dexscreener with a haircut, or zero if the token is gone
-            px = await ctx.dex.price_sol((await ctx.dex.best_pairs([p["mint"]])).get(p["mint"]))
-            sol = (amount / 10 ** p["decimals"]) * px * (1 - c["fallback_haircut"]) if px else 0.0
-            src = "dexscreener-est" if px else "no-route"
-        sol = max(sol, 0.0)
+            dpx = await ctx.dex.price_sol((await ctx.dex.best_pairs([p["mint"]])).get(p["mint"]))
+            sol_ = (amount / 10 ** p["decimals"]) * dpx * (1 - c["fallback_haircut"]) if dpx else 0.0
+            src = "dexscreener-est" if dpx else "no-route"
+        sol_ = max(sol_, 0.0)
         cost_basis = p["sol_in"] * amount / p["tokens_init"]
-        pnl = sol - cost_basis
+        pnl = sol_ - cost_basis
         left = p["tokens_left"] - amount
         closed = left <= p["tokens_init"] * 0.001
         self.db.x("INSERT INTO fills (position_id, ts, side, sol, tokens, pnl, reason, source) VALUES (?,?,?,?,?,?,?,?)",
-                  (p["id"], now(), "sell", sol, amount, pnl, reason, src))
+                  (p["id"], now(), "sell", sol_, amount, pnl, reason, src))
         self.db.x("UPDATE positions SET tokens_left=?, sol_out=sol_out+?, status=?, closed_ts=? WHERE id=?",
-                  (0 if closed else left, sol, "closed" if closed else "open", now() if closed else None, p["id"]))
-        p.update(tokens_left=0 if closed else left, sol_out=p["sol_out"] + sol, status="closed" if closed else "open")
+                  (0 if closed else left, sol_, "closed" if closed else "open", now() if closed else None, p["id"]))
+        p.update(tokens_left=0 if closed else left, sol_out=p["sol_out"] + sol_, status="closed" if closed else "open")
         tot = p["sol_out"] - p["sol_in"]
-        await ctx.tg.send(f"🔴 PAPER SELL #{p['id']} {p['symbol']} {frac:.0%} of remaining — {reason}\n"
-                          f"+{sol:.4f} SOL ({src}), trade PnL {pnl:+.4f} SOL"
-                          + (f"\nClosed. Total {tot:+.4f} SOL ({p['sol_out'] / p['sol_in']:.2f}x)" if closed else ""))
+        head = f"{mark(pnl)} <b>PAPER SELL #{p['id']}</b> · {esc(tok(p['symbol'], p['mint']))} · {frac * 100:.1f}% of rest"
+        body = f"{esc(reason)}\n{sol(sol_, False)} SOL ({esc(src)}) · PnL {sol(pnl)} SOL"
+        tail = (f"\n{mark(tot)} Closed · total {sol(tot)} SOL ({mult(p['sol_out'] / p['sol_in'])}) · 📄"
+                if closed and p["sol_in"] else "")
+        await ctx.tg.send(head + "\n" + body + tail)
         if closed:
             await ctx.watcher.sync()
 

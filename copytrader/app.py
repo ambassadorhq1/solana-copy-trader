@@ -39,23 +39,41 @@ def build_context(cfg, db=None, helius=None, jup=None, dex=None, env=None):
     ctx.executor = PaperExecutor(ctx)
     ctx.watcher = Watcher(ctx)
     ctx.scout_lock = asyncio.Lock()
+    from .clusters import ensure_schema
+    from .settings import apply
+    from .winners import ensure_schema as winners_schema
+    from .deep import ensure_schema as deep_schema
+    ensure_schema(ctx.db); winners_schema(ctx.db); deep_schema(ctx.db)
+    apply(ctx)  # Telegram /set overrides (DB) on top of config.yaml; paper stays forced
     return ctx
 
 
 async def daily_summary(ctx):
-    ex = ctx.executor
+    from .tgbot import PAPER, esc, mark, mult, pct, sol, table
     from .util import day_start_ts
-    d, a = ex.pnl(day_start_ts(ctx.cfg)), ex.pnl(0)
-    opened = ctx.db.val("SELECT COUNT(*) AS n FROM positions WHERE opened_ts>=?", (day_start_ts(ctx.cfg),), 0)
+    ex, t0 = ctx.executor, day_start_ts(ctx.cfg)
+    d, a = ex.pnl(t0), ex.pnl(0)
+    opened = ctx.db.val("SELECT COUNT(*) AS n FROM positions WHERE opened_ts>=?", (t0,), 0)
+    wr = lambda x: pct(x["wins"] / x["closed"]) if x["closed"] else "-"
+    rows = [["", "SOL", "CLOSED", "WIN%"],
+            ["Today", sol(d["realized"]), str(d["closed"]), wr(d)],
+            ["All", sol(a["realized"]), str(a["closed"]), wr(a)],
+            ["Open", sol(a["unrealized"]), str(len(ex.open_positions())), ""]]
+    text = (f"📊 <b>Daily summary</b> · {local_day(ctx.cfg)} · {PAPER}\n" + table(rows)
+            + f"{mark(d['realized'])} Entries {opened} · spent {sol(ex.spent_today(), False)} SOL · Helius {ctx.budget.used():,}/mo")
     try:
-        from .exits import summary_line
-        exit_line = "\n" + await asyncio.to_thread(summary_line, ctx)
+        from .exits import refresh_reco
+        from .tgbot import ladder
+        dist, reco = await asyncio.to_thread(refresh_reco, ctx)
+        if dist["n"]:
+            text += (f"\n📐 Exits: wallet median {mult(dist['median'])} (p25 {mult(dist['p25'])} · p75 {mult(dist['p75'])})"
+                     + (f" · TP {esc(ladder(reco['ladder']))} → {mult(reco['expected'])}/trade" if reco.get("ok")
+                        else f" · no ladder yet"))
+        else:
+            text += "\n📐 Exits: no closed trades yet"
     except Exception as e:
-        log.exception("exit summary failed: %s", e); exit_line = ""
-    await ctx.tg.send(f"📊 Daily paper summary {local_day(ctx.cfg)}\nEntries {opened} · spent {ex.spent_today():.2f} SOL\n"
-                      f"Realized today {d['realized']:+.4f} SOL ({d['closed']} closed, {d['wins']} wins)\n"
-                      f"All-time realized {a['realized']:+.4f} SOL · unrealized {a['unrealized']:+.4f} SOL\n"
-                      f"Open {len(ex.open_positions())} · Helius credits this month {ctx.budget.used()}" + exit_line)
+        log.exception("exit summary failed: %s", e)
+    await ctx.tg.send(text)
 
 
 async def scheduler_tick(ctx):
@@ -63,7 +81,7 @@ async def scheduler_tick(ctx):
     if ctx.budget.over_hard_stop() and db.kv_get("budget_stop") != today[:7]:
         db.kv_set("budget_stop", today[:7])
         await ctx.watcher.disable_webhook()
-        await ctx.tg.send("⚠️ Helius credit hard stop reached for this month: scouting/watching paused, exits still run.")
+        await ctx.tg.send("⚠️ <b>Helius hard stop</b>\nMonthly credit limit reached: scouting and watching paused. Exits still run.")
     ls = db.kv_get("last_scout") or {}
     if now() - (ls.get("ts") or 0) >= cfg["scout"]["interval_min"] * 60 and not ctx.scout_lock.locked() and ctx.helius.key:
         async with ctx.scout_lock:
@@ -72,6 +90,27 @@ async def scheduler_tick(ctx):
             finally:  # never re-scout every minute after a failure
                 if (db.kv_get("last_scout") or {}).get("ts", 0) < now() - 60:
                     db.kv_set("last_scout", {"ts": now(), "tokens": 0, "new_candidates": 0, "error": True})
+    from .winners import format_result, run_winners, wcfg
+    wc = wcfg(cfg)
+    if (wc["enabled"] and ctx.helius.key and hour >= wc["run_hour"] and db.kv_get("last_winners_day") != today
+            and not ctx.scout_lock.locked()):
+        db.kv_set("last_winners_day", today)
+        async with ctx.scout_lock:
+            res = await run_winners(ctx)
+        if res["tokens"] or res["scored"]:
+            await ctx.tg.send(format_result(res))
+    from . import deep
+    dc = deep.dcfg(cfg)
+    from datetime import datetime
+    from .util import tz
+    d_now = datetime.now(tz(cfg))
+    week = "%d-W%02d" % d_now.isocalendar()[:2]
+    if (dc["enabled"] and ctx.helius.key and d_now.weekday() == dc["run_weekday"] and hour >= dc["run_hour"]
+            and db.kv_get("last_deep_week") != week and not ctx.scout_lock.locked()):
+        db.kv_set("last_deep_week", week)
+        async with ctx.scout_lock:
+            res = await deep.run_deep(ctx)
+        await ctx.tg.send(deep.format_result(res))
     if hour >= cfg["scoring"]["rescore_hour"] and db.kv_get("last_rescore") != today:
         db.kv_set("last_rescore", today); await daily_rescore(ctx)
         from .exits import prune_samples
@@ -118,6 +157,8 @@ def make_app(ctx, start_background=True):
     app.router.add_get("/health", health)
     app.router.add_post("/tg", tg)
     app.router.add_post("/helius", helius)
+    from .dashboard import add_routes
+    add_routes(app, ctx)  # GET /dashboard + GET /api/summary (read-only, key-protected)
 
     async def on_start(_):
         if not start_background:
@@ -130,7 +171,7 @@ def make_app(ctx, start_background=True):
         app["tasks"] = [asyncio.create_task(_loop("scheduler", lambda: scheduler_tick(ctx), 60)),
                         asyncio.create_task(_loop("exits", ctx.executor.check_exits, ctx.cfg["execution"]["exit_check_s"])),
                         asyncio.create_task(ctx.watcher.poll_loop())]
-        await ctx.tg.send(f"🚀 Copy-trader started (PAPER, watcher={ctx.watcher.mode}). /help")
+        await ctx.tg.send(f"🚀 <b>Copy-trader started</b> · 📄 PAPER · {ctx.watcher.mode}\n/help")
 
     async def on_stop(_):
         for t in app.get("tasks", []) + ([app["tg_poll"]] if "tg_poll" in app else []):

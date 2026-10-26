@@ -132,6 +132,10 @@ async def score_wallet(ctx, w, purpose="scout"):
     reasons = evaluate(s, cfg)
     if db.one("SELECT 1 AS x FROM tokens WHERE creator=?", (w["address"],)):
         reasons.append("dev/creator")
+    from .deep import insider_override  # 🎯 insider_likely: volume rules waived, hard filters kept, ranked first
+    ins = insider_override(db, w["address"], reasons, cfg, t)
+    if ins:
+        reasons = ins[0]
     funder = w.get("funder")
     if not reasons and not funder:
         first = await ctx.helius.history(w["address"], purpose, asc=True, limit=10)
@@ -142,16 +146,19 @@ async def score_wallet(ctx, w, purpose="scout"):
         n_same = db.val("SELECT COUNT(*) AS n FROM wallets WHERE funder=? AND address<>?", (funder, w["address"]), 0)
         if n_same + 1 >= c["funder_cluster_max"]:
             reasons.append(f"funder cluster x{n_same + 1}")
-    score = composite(s)
+    score = composite(s) + (ins[1] if ins else 0)
     old = w.get("status")
-    if old == "watch":
+    if ins and ins[2]:
+        status = "dormant"  # no swap in the last 7 days: off the watchlist, re-checked weekly by the deep scout
+    elif old == "watch":
         demote = s["loss_streak"] >= c["demote_loss_streak"] or s["pnl_7d"] < 0 or (c["demote_on_rule_fail"] and reasons)
         status = "demoted" if demote else "watch"
     else:
         n_watch = db.val("SELECT COUNT(*) AS n FROM wallets WHERE status='watch'", (), 0)
         status = ("watch" if n_watch < c["max_watch"] else "qualified") if not reasons else "rejected"
-    reason = ", ".join(reasons) or ("loss streak" if s["loss_streak"] >= c["demote_loss_streak"] else
-                                    "7d pnl<0" if status == "demoted" else "ok")
+    reason = ", ".join(reasons) or ("inactive >7d" if status == "dormant" else
+                                    "loss streak" if s["loss_streak"] >= c["demote_loss_streak"] else
+                                    "7d pnl<0" if status == "demoted" else "insider_likely" if ins else "ok")
     db.x("UPDATE wallets SET status=?, score=?, stats=?, reason=?, funder=?, scored_at=?, backfilled_to=? WHERE address=?",
          (status, score, json.dumps(s), reason, funder, t, t, w["address"]))
     log.info("score %s -> %s (%s) %s", short(w["address"]), status, score, reason)
@@ -173,7 +180,8 @@ async def process_candidates(ctx, limit):
     if changed:
         await ctx.watcher.sync()
         for a, s in changed:
-            await ctx.tg.send(f"➕ Watching {short(a)}: {s['closed']} trades, WR {s['win_rate']:.0%}, "
+            from .deep import is_insider
+            await ctx.tg.send(f"➕ {'🎯 ' if is_insider(ctx.db, a) else ''}Watching {short(a)}: {s['closed']} trades, WR {s['win_rate']:.0%}, "
                               f"PnL {s['pnl_sol']:.1f} SOL, med win {s['median_win_mult']}x")
     return n
 
