@@ -9,18 +9,23 @@ Helius free plan, Jupiter keyless, Dexscreener, Telegram, Render free, any free 
 
 | Component | File | What it does |
 |---|---|---|
-| HTTP | `copytrader/app.py` | aiohttp on `$PORT`: `GET /health`, `POST /tg` (Telegram webhook), `POST /helius` (Helius raw webhook). Background loops for scout, exits and daily jobs. |
+| HTTP | `copytrader/app.py` | aiohttp on `$PORT`: `GET /health`, `POST /tg` (Telegram webhook), `POST /helius` (Helius raw webhook), `GET /dashboard` + `GET /api/summary` (read-only). Background loops for scout, exits and daily/weekly jobs. |
 | Scout | `scout.py` | Every 2h: Dexscreener boosts/profiles → Solana tokens 1–72h old, +300% (h6/h24), liquidity ≥ $20k → Helius `getTransactionsForAddress` (oldest-first) on the mint → early buyers (first 30 min, skips the creator and launch-slot snipers) become **candidates**. |
 | Scorer | `scorer.py` | Backfills 30 days of each candidate's swaps (gTFA, 500 txs = 50 credits), then applies the architecture rules: ≥20 closed trades, win rate ≥55% (win = +30%), PnL ≥50 SOL, median win ≥2x, top trade <50% of PnL, median entry ≤30 min after launch, not a sniper, median hold 10 min–24 h. It excludes insiders (tokens received without buying), bundlers (same slot + mint as other candidates), fast dumpers, wash traders, dev/creator wallets, deployer-funded wallets and shared-funder clusters. Passing wallets go to the **watchlist** (up to 25), then to a bench. Re-scored daily. A wallet is demoted after 5 straight losses, 7-day PnL < 0, or failing a rule. |
 | Watcher | `watcher.py` | **Webhook mode** (default on Render): one Helius raw webhook on the watchlist plus wallets with open positions. It is re-synced only when that set changes (100 credits per edit). **Poll mode** (fallback, used locally): `getSignaturesForAddress` per wallet, with the interval stretched automatically to fit `poll_daily_credits`. |
 | Paper executor | `executor.py` | 0.1 SOL per trade, daily cap 1 SOL, at most 5 open positions, 1 entry per token. Checks before entry: wallet buy ≥ 0.2 SOL, signal < 3 min old, liquidity ≥ $10k, mint and freeze authority revoked, Jupiter route with price impact ≤ 15%, our price ≤ 1.5x the wallet's entry, and an immediate sell quote that returns ≥ 70% (honeypot check). The fill is the Jupiter `outAmount` minus a 1% haircut and 0.0005 SOL in fees. |
 | Exits | `executor.py` | Default exits run together: **follow** (when the wallet sells X%, we sell X% of what's left), **TP ladder** (default 50% at 2x, the rest at 3x; or any `execution.tp_ladder`; each position keeps the ladder it opened with), **stop-loss** at −50%, **time stop** at 24 h. Prices are checked every 30 s on Dexscreener and stored in `price_samples`; sells fill at a Jupiter quote. With no route, a sell is valued at the Dexscreener price minus 15%, or 0 if the token has no price. |
 | Exit analytics | `exits.py` | From closed trades of watchlist wallets (and our closed paper trades): size-weighted realized exit multiples (partial sells count) with p25/median/p75, hit rates for ≥2x…100x, and the 24 h peak after **our** entry (wallet's first-buy price +15% by default). Prices come from every stored swap on the mint (lower bound on the peak) and the executor's own 30 s samples (`price_samples`). A recommender replays each trade through candidate TP ladders with the bot's real rules and suggests the best one as `execution.tp_ladder`. |
-| Telegram | `tgbot.py` | Alerts on each paper buy and sell, a daily PnL summary at 21:00 Lagos time, and commands. Only `TELEGRAM_CHAT_ID` is obeyed. |
+| Telegram | `tgbot.py` | HTML messages (bold headers, `<pre>` tables, 🟢 profit / 🔴 loss / ⏸ paused / 📄 PAPER / 🎯 insider-likely). 3–5 line buy/sell alerts, a daily PnL summary at 21:00 Lagos time, and commands. Only `TELEGRAM_CHAT_ID` is obeyed. Messages are clipped safely under 4096 chars; if Telegram rejects the markup the alert is resent as plain text. |
+| Dashboard | `dashboard.py` | Read-only mobile page + JSON (see below). |
+| Clusters | `clusters.py` | Smart-money cluster alert: several watchlist wallets buying the same new token (alert only, never buys). |
+| Settings | `settings.py` | `/set` + `/settings`: DB overrides on top of `config.yaml` for a few knobs. Paper mode is forced. |
+| Winners scout | `winners.py` | Daily: early buyers of big 1–30-day-old pumps who sold ≥ 3x on ≥ 2 of them and are still active → scorer. |
+| Deep scout | `deep.py` | Weekly, 1-year lookback: early (pre-move) buyers on ≥ 2 winners → 🎯 `insider_likely` (active) or `dormant`. |
 | Live | `live.py` | A stub that raises an error. With `mode: live` in config the app refuses to start. |
 
 ### Telegram commands
-`/status` `/wallets` `/positions` `/pnl` `/exits [wallet]` `/pause` `/resume` `/help`
+`/status` `/wallets` `/positions` `/pnl` `/clusters` `/exits [wallet]` `/settings` `/set <key> <value>` `/scout_winners [deep]` `/pause` `/resume` `/help`
 `/exits` shows the exit table and suggested ladder for the watchlist; `/exits <address or prefix>` for one wallet.
 The daily summary ends with a one-line exit summary.
 `/exit <id> follow|2x|3x|now` sets the exit for one trade:
@@ -44,12 +49,66 @@ Stop-loss and the 24 h time stop always stay on. `/pause` stops new entries; exi
 Limits: swap prices are sparse, so peaks are lower bounds and stop-loss timing is approximate. The simulation assumes we sell
 at the wallet's price when following, which flatters runners. Treat the suggestion as a starting point and check it against paper results.
 
+## Dashboard (read-only)
+Open `https://<your-service>.onrender.com/dashboard?key=<KEY>` on your phone. `<KEY>` is env `DASHBOARD_KEY` if you set one,
+otherwise the existing `TG_WEBHOOK_SECRET` (Render → service → Environment), so no new env var is needed.
+The first visit sets an HttpOnly cookie (90 days) and strips the key from the address bar; bookmark `/dashboard` afterwards.
+A missing or wrong key gets 401 (constant-time compare). There are no write actions.
+- One self-contained HTML page (inline CSS + vanilla JS, no CDNs, ~9 KB) that fetches `GET /api/summary` every 30 s
+  (paused while the tab is hidden). `/api/summary` also accepts `?key=`.
+- Sections: status bar (PAPER, running/paused, watcher mode, uptime, Helius credits this month, open/spent, last deep scout),
+  PnL cards (realized total, today, win rate, closed trades), open positions, smart-money clusters (last 10), closed trades
+  (last 20), watchlist + bench + dormant (🎯 = insider-likely) and the exit summary.
+- Cheap: a handful of SQL queries, cached in-process for 10 s. Exit stats come from the cached daily recommendation; the hit
+  rates are filled once per new recommendation in a background thread, never inside a request.
+
+## Smart-money clusters (alert only)
+When ≥ `clusters.min_wallets` (3) distinct **watchlist** wallets buy the same token within `window_min` (60) minutes, or
+≥ `min_wallets_for_amount` (2) wallets buy ≥ `min_total_sol` (5) SOL combined, and the token's pair is younger than
+`max_token_age_h` (24 h), one Telegram alert goes out: symbol, short mint, Dexscreener link, age, liquidity, mcap, wallet
+count, total SOL and each wallet's short form, score and buy size. It re-alerts only when the wallet count grows by +2 or the
+total SOL doubles. Uses the swaps the watcher already stores; the only extra call is one keyless Dexscreener lookup once the
+wallet thresholds pass. `auto_paper_buy: false` is reserved; nothing is bought. `/clusters` lists the last 10.
+
+## Settings from Telegram
+`/settings` shows the knobs; `/set <key> <value>` stores an override in the DB (survives redeploys, beats `config.yaml`);
+`/set <key> default` removes it. Keys: `trade_sol` (0.01 up to `execution.max_per_trade_sol` and the daily cap), `stop_loss`
+(% loss, 5–95), `time_stop_h` (1–168), `tp_ladder` (e.g. `50@2,50@4`, 1–4 tranches, rising multiples, ≤ 100%),
+`cluster_wallets` (2–25), `cluster_window` (5–1440 min), `cluster_sol` (0.1–10000), `cluster_age_h` (1–168). The dotted
+config names (`clusters.min_wallets`, …) work too. `mode` is not settable: paper is forced and no command enables live trading.
+A new TP ladder applies to new trades only.
+
+## Winners scouts
+**Daily (`winners.py`, `/scout_winners`):** Solana pairs 1–30 days old with mcap ≥ $1M and liquidity ≥ $50k, from free
+Dexscreener boosts, profiles, `/latest/dex/search` and the normal scout's finds (≤ 20 new tokens a run, each once). Early buyers
+come from the mint's oldest 200 txs (20 credits): bought within 60 min of the first tx or at ≤ 20% of today's price, creator
+and launch-slot snipers skipped. Only wallets early on ≥ 2 winners get a history fetch (50 credits); they must have sold ≥ 3x
+realized on ≥ 2 of them and have a swap in the last 7 days, then the normal scorer decides. Credits are metered as `winners`
+(10% of the daily allowance).
+
+**Deep (`deep.py`, `/scout_winners deep`, Sundays 04:00):** 1-year lookback. Tokens = `scout.seed_winners` (curated mints)
++ Dexscreener discoveries launched ≤ 365 days ago (mcap ≥ $10M, 24h volume ≥ $50k, clone pairs with liquidity ≈ mcap dropped).
+Early buyers are sampled with `getTransactionsForAddress` **ascending inside a blockTime window** (7 slices of 100 txs in the
+first 60 minutes, ~80 credits per token however big the token is), so nothing pages through millions of signatures. If the
+plan refuses gTFA, it falls back to `getSignaturesForAddress` on the earliest pool / bonding curve, only when the launch is
+reachable within `max_sig_pages` pages; bigger tokens are skipped and logged. Caps: 400 credits per token, 12,000 per run,
+purpose `deep` (50% of that day's allowance) and the monthly hard stop.
+Still excluded: the dev/creator, block-0/1 snipers and same-slot bundles (≥ 3 wallets). Wallets that bought **before the big
+move** (≤ 25% of the later high) on ≥ 2 separate winners get one activity probe: active in the last 7 days → tagged 🎯
+`insider_likely`, scored with the volume rules waived but every hard filter kept (sniper, insider transfers, bundler, dev,
+deployer-funded, funder cluster, wash, fast-dump) and +100 score so they rank first; inactive → `dormant`, re-probed weekly.
+🎯 shows in `/wallets`, the dashboard, buy alerts and cluster alerts.
+All twelve current seeds launched more than 12 months ago (Dec 2022 – Jan 2025), so with `seed_max_age_days: 365` they are
+skipped and logged; raise it (e.g. 1500) to scan them.
+
 ## Run locally
 ```bash
 cd code
 pip install -r requirements.txt
 python -m tests.test_dryrun          # full mocked dry run, no keys or network needed (or: pytest -q)
 python -m tests.test_exits           # exit analytics + ladder recommender + /exits + auto-tune, mocked
+python -m tests.test_dashboard       # dashboard auth, /api/summary, cache, no external URLs
+python -m tests.test_features        # clusters, /set, winners + deep scouts, 🎯 tagging, Telegram HTML
 HELIUS_API_KEY=... TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python main.py   # SQLite + polling
 ```
 Without `PUBLIC_URL`, the app uses Telegram long polling and Helius polling. All tunables are in `config.yaml`.
@@ -83,7 +142,9 @@ a webhook event is 1, and creating or editing a webhook is 100.
 | Webhook events | 25 wallets × ~40 tx/day × 1 | ~30,000 |
 | Webhook edits | ~3/day × 100 | ~9,000 |
 | Executor mint checks | ~1 per signal | ~1,000 |
-| **Total, webhook mode** | | **≈ 190,000 (~19%)** |
+| Winners scout (daily) | 20 tokens × 20 + 8 wallets × ~70 | ~29,000 |
+| Deep scout (weekly) | 12 tokens × ~80 + 10 probes + 10 wallets × ~70, capped 12,000/run | ~8,000–48,000 |
+| **Total, webhook mode** | | **≈ 230,000–270,000 (~25%)** |
 | Poll-mode alternative | 12,000/day cap | +360,000 instead of webhook events |
 
 Guards: scout plus backfill may use at most 35% of each day's allowance, and rescore at most 10%. At 97% of the monthly

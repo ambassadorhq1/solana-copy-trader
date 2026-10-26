@@ -8,6 +8,8 @@ budget:                     # Helius free = 1M credits/month. Our own meter; the
   hard_stop_frac: 0.97             # above this share of the monthly budget: scouting stops, webhook is removed
   scout_share: 0.35                # max share of the daily allowance scout + backfill may spend
   score_share: 0.10                # max share for the daily rescore of watchlist wallets
+  winners_share: 0.10              # max share for the daily winners backfill scout
+  deep_share: 0.50                 # max share of that day's allowance for the weekly deep scout (also capped per run below)
 
 rate_limits:
   helius_rps: 8             # free plan 10 RPS
@@ -34,6 +36,52 @@ scout:                      # candidates = early buyers of recently pumped token
   backfill_per_run: 6       # candidate wallets backfilled + scored per run
   backfill_limit: 500       # txs per page (50 credits)
   backfill_pages: 1
+  # Deep winners scout (1-year lookback): weekly + /scout_winners deep. Mints looked up on Dexscreener 2026-10-26
+  # (search by name/symbol, highest 24h volume, clones with liquidity ~= mcap dropped; PNUT via address lookup because
+  # name search only returned clones). launched = earliest Dexscreener pair. NOTE: all of these launched more than
+  # 12 months ago, so with seed_max_age_days: 1500 they are skipped and logged; raise it (e.g. 1500) to scan them.
+  seed_winners:
+    - {symbol: TRUMP,    mint: 6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN, launched: 2025-01-18}
+    - {symbol: FARTCOIN, mint: 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump, launched: 2024-10-18}
+    - {symbol: PNUT,     mint: 2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump, launched: 2024-10-31}
+    - {symbol: GOAT,     mint: CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump, launched: 2024-10-10}
+    - {symbol: MOODENG,  mint: ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY, launched: 2024-09-10}
+    - {symbol: CHILLGUY, mint: Df6yfrKC8kZE3KNkrHERKzAetSxbrWeniQfyJY4Jpump, launched: 2024-11-15}
+    - {symbol: AI16Z,    mint: HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC, launched: 2024-10-25}
+    - {symbol: MEW,      mint: MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5, launched: 2024-03-26}
+    - {symbol: BOME,     mint: ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82, launched: 2024-03-14}
+    - {symbol: POPCAT,   mint: 7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr, launched: 2023-12-12}
+    - {symbol: WIF,      mint: EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm, launched: 2023-11-20}
+    - {symbol: BONK,     mint: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263, launched: 2022-12-20}
+  deep:
+    enabled: true
+    run_weekday: 6            # 0 = Monday ... 6 = Sunday (local time)
+    run_hour: 4
+    max_age_days: 365         # Dexscreener-discovered winners launched within N days
+    seed_max_age_days: 1500    # same for seed_winners (raise to include older famous coins)
+    tokens_per_run: 12
+    min_mcap_usd: 10000000
+    min_volume_usd: 50000     # 24h volume; filters dead clones
+    max_liq_mcap_ratio: 0.6   # liquidity ~= mcap is the fingerprint of fake clone pairs
+    search_queries: [pump, meme, solana, dog, cat, ai, official, coin]
+    window_min: 60            # early window after launch
+    slices_min: [0, 2, 5, 10, 20, 35, 50]   # gTFA asc slices sampled inside the window (no paging through history)
+    slice_limit: 100          # txs per slice (10 credits)
+    sniper_slots: 2           # block 0/1 buyers are snipers (excluded)
+    bundle_min_wallets: 3     # >= N early buyers in the same slot = bundle (excluded)
+    pre_move_frac: 0.25       # "before the big move" = paid <= 25% of the later high
+    max_buyers_per_token: 60
+    max_credits_per_token: 400
+    max_credits_per_run: 12000
+    archival_cost: 10         # credits per getSignaturesForAddress / getTransaction in the fallback (Helius docs say 1 or 10)
+    max_sig_pages: 10         # fallback only: skip tokens needing more 1000-signature pages to reach launch
+    max_fallback_txs: 30
+    min_repeat: 2             # early (pre-move) on >= N separate winners -> insider_likely if active
+    active_days: 7            # watchlist needs a swap/tx in the last N days; others go to the dormant list
+    wallets_per_run: 10
+    dormant_recheck_days: 7
+    dormant_per_run: 20
+    insider_score_bonus: 100  # ranks 🎯 wallets first
 
 scoring:                    # docs/architecture.md "Wallet scoring (v1)"
   window_days: 30
@@ -70,6 +118,7 @@ watch:
 
 execution:
   per_trade_sol: 0.1
+  max_per_trade_sol: 0.1    # ceiling for Telegram /set trade_sol (also capped at daily_cap_sol)
   daily_cap_sol: 1.0
   max_open: 5
   slippage_bps: 1500
@@ -105,3 +154,35 @@ exits:                      # exit analytics (/exits, daily line) + optional aut
   auto_tune_min_paper_trades: 30   # ...but only after this many closed paper trades
   reco_max_age_h: 26        # cached recommendation is recomputed when older (normally refreshed by the daily summary)
   sample_retention_days: 30 # our 30 s price samples are pruned after this
+
+clusters:                   # smart-money cluster alert: several WATCHLIST wallets buying the same new token
+  enabled: true
+  min_wallets: 3            # >= N distinct watch wallets inside the window ...
+  window_min: 60            # ... rolling window, minutes (buys in [this buy - window, this buy])
+  min_wallets_for_amount: 2 # ... OR >= N wallets whose combined buys are >= min_total_sol
+  min_total_sol: 5.0
+  max_token_age_h: 24       # only tokens whose pair is younger than this
+  realert_wallets_delta: 2  # after the first alert, alert again only at +N wallets ...
+  realert_sol_mult: 2.0     # ... or when the total SOL reaches this multiple of the last alerted total
+  auto_paper_buy: false     # reserved for later: clusters are alert-only, nothing is bought
+
+winners:                    # winners backfill scout: seed candidates from big recent pumps (daily + /scout_winners)
+  enabled: true
+  run_hour: 3               # local hour, once a day
+  tokens_per_run: 20        # new winner tokens per run (each token is processed once)
+  max_age_days: 30          # pair created within the last N days ...
+  min_age_h: 24             # ... and at least this old (so early buyers had time to sell)
+  min_mcap_usd: 1000000
+  min_liquidity_usd: 50000
+  search_queries: [pump, solana, meme, bonk]   # free Dexscreener /latest/dex/search words (plus boosts/profiles/scouted mints)
+  early_tx_limit: 200       # oldest txs of the mint (20 credits)
+  early_window_min: 60      # early = bought within N min of the first tx ...
+  max_entry_frac_of_now: 0.2  # ... or at <= 20% of the current price
+  sniper_slots: 2
+  max_buyers_per_token: 25
+  min_repeat: 2             # early on >= N winners AND sold >= min_realized_mult on >= N of them
+  min_realized_mult: 3.0
+  min_sold_frac: 0.5        # at least half the bag sold for the realized multiple to count
+  active_days: 7            # must have a swap in the last N days
+  wallets_per_run: 8        # history fetches per run (50 credits each)
+  recheck_days: 7           # don't re-fetch a wallet that failed within N days
