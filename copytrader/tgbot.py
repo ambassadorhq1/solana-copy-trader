@@ -423,11 +423,19 @@ class Telegram:
     def settings(self):
         from .settings import KNOBS, overrides, show
         ov = overrides(self.ctx)
-        t = [["KEY", "VALUE"]] + [[k + (" *" if k in ov else ""), show(self.ctx, k)] for k in KNOBS]
-        return (f"⚙️ <b>Settings</b> · {PAPER} (forced)\n" + table(t, "ll")
-                + "<i>* = override saved in the DB (beats config.yaml)</i>\n"
-                  "<code>/set trade_sol 0.05</code> · <code>/set stop_loss 40</code>\n"
-                  "<code>/set tp_ladder 50@2,50@4</code> · <code>/set &lt;key&gt; default</code>")
+        names = {"trade_sol": "💵 Trade size", "stop_loss": "🛑 Stop loss", "time_stop_h": "⏳ Time stop",
+                 "tp_ladder": "🎯 Take profit", "cluster_wallets": "👥 Cluster wallets",
+                 "cluster_window": "⏱ Cluster window", "cluster_sol": "💰 Cluster SOL",
+                 "cluster_age_h": "🕒 Max token age", "exit_mode": "🚪 Exit mode"}
+        units = {"time_stop_h": " h", "cluster_window": " min", "cluster_sol": " SOL", "cluster_age_h": " h"}
+        lines = []
+        for k in KNOBS:
+            v = html.escape(str(show(self.ctx, k)))
+            lines.append(f"{names.get(k, k)}: <b>{v}{units.get(k, '')}</b>" + (" ✏️" if k in ov else ""))
+        return (f"⚙️ <b>Settings</b> · 📄 Paper mode\n\n" + "\n".join(lines) +
+                "\n\n<b>Tap to change</b>\n"
+                "Row 1 💵 trade size\nRow 2 ⏱ cluster window\nRow 3 🕒 token age\nRow 4 🎯 take profit\n"
+                "\n<i>✏️ = changed by you</i>")
 
     def scout_winners(self, deep=False):
         ctx = self.ctx
