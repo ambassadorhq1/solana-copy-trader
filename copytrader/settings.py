@@ -15,7 +15,9 @@ KNOBS = {
     "cluster_window":  (("clusters", "window_min"), "int", 5, 1440, "cluster: window, minutes"),
     "cluster_sol":     (("clusters", "min_total_sol"), "float", 0.1, 10000, "cluster: min combined SOL"),
     "cluster_age_h":   (("clusters", "max_token_age_h"), "float", 1, 168, "cluster: max token age, hours"),
+    "exit_mode":       (("execution", "default_exit"), "choice", None, None, "new trades: ladder (TP ladder) or follow (sell when the wallet sells)"),
 }
+CHOICES = {"exit_mode": {"ladder": "ladder", "default": "ladder", "tp": "ladder", "follow": "follow", "wallet": "follow"}}
 ALIASES = {"per_trade_sol": "trade_sol", "size": "trade_sol", "sl": "stop_loss", "stop": "stop_loss", "time_stop": "time_stop_h",
            "ladder": "tp_ladder", "tp": "tp_ladder", "clusters.min_wallets": "cluster_wallets",
            "clusters.window_min": "cluster_window", "clusters.min_total_sol": "cluster_sol",
@@ -75,6 +77,11 @@ def validate(key, raw, base):
     path, kind, lo, hi, _ = KNOBS[key]
     if kind == "ladder":
         return parse_ladder(raw)
+    if kind == "choice":
+        v = CHOICES[key].get(raw.strip().lower())
+        if not v:
+            raise ValueError(f"{key} must be one of: {', '.join(sorted(set(CHOICES[key].values())))}")
+        return v
     raw = raw.strip().rstrip("%").lstrip("-") if kind == "loss" else raw.strip().rstrip("hmx").replace("sol", "").strip()
     try:
         v = int(raw) if kind == "int" else float(raw)
@@ -130,7 +137,7 @@ def set_value(ctx, key, raw):
         return False, str(e)
     ov[k] = v
     ctx.db.kv_set(KV, ov); apply(ctx)
-    note = " (new trades only; open positions keep their ladder)" if k == "tp_ladder" else ""
+    note = " (new trades only; open positions keep their ladder)" if k in ("tp_ladder", "exit_mode") else ""
     return True, f"{k} = {show(ctx, k)}{note}"
 
 
@@ -141,6 +148,8 @@ def show(ctx, key):
         from .exits import config_ladder
         from .tgbot import ladder
         return ladder(config_ladder(ctx.cfg["execution"]))
+    if kind == "choice":
+        return v or "ladder"
     if kind == "loss":
         return f"-{(1 - float(v)) * 100:.1f}%"
     if key == "trade_sol":

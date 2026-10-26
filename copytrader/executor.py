@@ -2,7 +2,7 @@
 import asyncio, json
 
 from .exits import config_ladder, entry_ladder, fmt_ladder
-from .tgbot import esc, ladder, mark, mult, px, sol, tok
+from .tgbot import esc, ladder, mark, mult, position_kb, px, sol, tok
 from .util import WSOL, log, now, short, day_start_ts
 
 EXIT_MODES = ("default", "follow", "2x", "3x", "now")
@@ -86,8 +86,9 @@ class PaperExecutor:
         sym = ((pair or {}).get("baseToken") or {}).get("symbol") or short(s["mint"])
         ladder_, lsrc = await entry_ladder(ctx)  # fixed for this trade's life; auto-tune only affects new trades
         pid = self.db.insert("INSERT INTO positions (mint, symbol, wallet, opened_ts, sol_in, tokens_init, tokens_left, decimals, "
-                             "entry_price, wallet_price, last_price, tp_ladder) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (s["mint"], sym, s["wallet"], now(), cost, out, out, dec, our_px, wallet_px, our_px, json.dumps(ladder_)))
+                             "entry_price, wallet_price, last_price, tp_ladder, exit_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (s["mint"], sym, s["wallet"], now(), cost, out, out, dec, our_px, wallet_px, our_px, json.dumps(ladder_),
+                              "follow" if c.get("default_exit") == "follow" else "default"))
         self.db.x("INSERT INTO price_samples (mint, ts, price) VALUES (?,?,?)", (s["mint"], now(), our_px))
         self.db.x("INSERT INTO fills (position_id, ts, side, sol, tokens, reason, source) VALUES (?,?,?,?,?,?,?)",
                   (pid, now(), "buy", cost, out, f"copy {short(s['wallet'])}", "jupiter"))
@@ -98,7 +99,8 @@ class PaperExecutor:
                           f"{sol(cost, False)} SOL @ <code>{px(our_px)}</code> · wallet {esc(short(s['wallet']))} paid "
                           f"<code>{px(wallet_px)}</code> ({sol(s['sol'], False)} SOL)\n"
                           f"Liq ${liq:,.0f} · TP {esc(ladder(ladder_))} [{esc(lsrc)}]\n"
-                          f"SL −50% · 24h stop · <code>/exit {pid} follow|2x|3x|now</code>")
+                          + (f"Exit: follow wallet\n" if c.get("default_exit") == "follow" else "")
+                          + f"SL −50% · 24h stop · <code>/exit {pid} follow|2x|3x|now</code>", markup=position_kb(pid))
 
     async def _follow_sell(self, s):
         for p in self.db.all("SELECT * FROM positions WHERE status='open' AND wallet=? AND mint=? AND exit_mode IN ('default','follow')",

@@ -8,6 +8,7 @@ MAX_LEN = 4096
 PAPER = "📄 PAPER"
 
 HELP = ("🤖 <b>Copy-trader</b> · " + PAPER + " only\n\n"
+        "/menu — buttons (or tap ☰ Menu)\n\n"
         "<b>Overview</b>\n/status · /pnl\n/positions · /wallets\n/clusters — recent smart-money clusters\n\n"
         "<b>Exits</b>\n/exits — stats + suggested TP ladder\n/exits &lt;wallet&gt; — one wallet (prefix ok)\n"
         "/exit &lt;id&gt; follow|2x|3x|now\n\n"
@@ -103,6 +104,64 @@ def clip(text, limit=MAX_LEN):
     return cut + "\n… (trimmed)"
 
 
+# ---------------------------------------------------------------- inline keyboards (callback_data stays well under 64 bytes)
+MENU_BTN = "☰ Menu"
+REPLY_KB = {"keyboard": [[{"text": MENU_BTN}]], "resize_keyboard": True, "is_persistent": True}
+SIZES = (0.05, 0.1, 0.25)
+WINDOWS = ((30, "30m"), (60, "60m"), (120, "2h"))
+AGES = (6, 24, 72)
+LADDERS = {"23": ("2x/3x", "50@2,50@3"), "2510": ("2x/5x/10x", "34@2,33@5,33@10"), "f": ("follow wallet", None)}
+VIEWS = {"status": "/status", "pnl": "/pnl", "pos": "/positions", "wal": "/wallets", "clu": "/clusters", "exits": "/exits",
+         "scout": "/scout_winners", "deep": "/scout_winners deep"}
+
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def kb(*rows):
+    return {"inline_keyboard": [list(r) for r in rows]}
+
+
+BACK = [btn("⬅️ Menu", "m:menu")]
+
+
+def menu_kb(paused):
+    return kb([btn("📊 Status", "m:status"), btn("💰 PnL", "m:pnl"), btn("📂 Positions", "m:pos")],
+              [btn("🎯 Wallets", "m:wal"), btn("🧠 Clusters", "m:clu"), btn("🚪 Exits", "m:exits")],
+              [btn("🔍 Scout", "m:scout"), btn("🔍 Deep scout", "m:deep")],
+              [btn("⚙️ Settings", "m:set")],
+              [btn("▶️ Resume", "m:toggle") if paused else btn("⏸ Pause", "m:toggle")])
+
+
+def position_kb(pid):
+    return kb([btn("🔴 Sell now", f"p:{pid}:now"), btn("🎯 TP 2x", f"p:{pid}:2x"), btn("🎯 TP 3x", f"p:{pid}:3x")],
+              [btn("👛 Follow wallet", f"p:{pid}:follow")])
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def settings_kb(ctx):
+    from .exits import config_ladder
+    e, c = ctx.cfg["execution"], ctx.cfg.get("clusters") or {}
+    on = lambda ok, t: ("✅ " if ok else "") + t
+    lad = config_ladder(e)
+    follow = e.get("default_exit") == "follow"
+    lad_is = lambda spec: not follow and [(t["mult"], round(t["frac"], 2)) for t in lad] == \
+        [(float(m), round(float(f) / 100, 2)) for f, m in (x.split("@") for x in spec.split(","))]
+    return kb([btn(on(abs(_f(e.get("per_trade_sol")) - v) < 1e-9, f"{v:g}" + (" SOL" if v == SIZES[-1] else "")), f"s:sz:{v:g}")
+               for v in SIZES],
+              [btn(on(_f(c.get("window_min")) == m, "⏱ " + t), f"s:cw:{m}") for m, t in WINDOWS],
+              [btn(on(_f(c.get("max_token_age_h")) == h, f"🕒 {h}h"), f"s:age:{h}") for h in AGES],
+              [btn(on(follow if k == "f" else lad_is(spec), name), f"s:tp:{k}") for k, (name, spec) in LADDERS.items()],
+              BACK)
+
+
 def plain(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
@@ -111,7 +170,7 @@ class Telegram:
     def __init__(self, ctx, token, chat_id, http):
         self.ctx, self.token, self.chat_id, self.http = ctx, token, str(chat_id or ""), http
         self.api = f"https://api.telegram.org/bot{token}/"
-        self.sent = []  # kept for tests / dry-run
+        self.sent, self.markups = [], []  # kept for tests / dry-run
 
     async def call(self, method, **params):
         if not self.token:
@@ -120,22 +179,40 @@ class Telegram:
         async with s.post(self.api + method, json=params) as r:
             return await r.json(content_type=None)
 
-    async def send(self, text):
+    async def send(self, text, markup=None):
         text = clip(text)
         self.sent.append(text)
+        self.markups.append(markup)
         log.info("TG> %s", plain(text).replace("\n", " | "))
         if self.token and self.chat_id:
+            extra = {"reply_markup": markup} if markup else {}
             try:
                 r = await self.call("sendMessage", chat_id=self.chat_id, text=text, parse_mode="HTML",
-                                    disable_web_page_preview=True) or {}
+                                    disable_web_page_preview=True, **extra) or {}
                 if r.get("ok") is False:  # bad markup somewhere: never lose the alert, resend as plain text
                     log.warning("telegram HTML rejected (%s), resending plain", r.get("description"))
-                    await self.call("sendMessage", chat_id=self.chat_id, text=plain(text)[:MAX_LEN], disable_web_page_preview=True)
+                    await self.call("sendMessage", chat_id=self.chat_id, text=plain(text)[:MAX_LEN], disable_web_page_preview=True, **extra)
             except Exception as e:
                 log.warning("telegram send failed: %s", e)
 
+    async def edit(self, msg, text, markup):
+        """Edit the tapped message in place; fall back to a new message (which has its own plain-text fallback)."""
+        text = clip(text)
+        mid = (msg or {}).get("message_id")
+        if self.token and mid:
+            try:
+                r = await self.call("editMessageText", chat_id=self.chat_id, message_id=mid, text=text, parse_mode="HTML",
+                                    disable_web_page_preview=True, reply_markup=markup) or {}
+                if r.get("ok") is not False or "not modified" in str(r.get("description", "")):
+                    self.sent.append(text); self.markups.append(markup)
+                    return
+                log.warning("telegram edit rejected (%s), sending instead", r.get("description"))
+            except Exception as e:
+                log.warning("telegram edit failed: %s", e)
+        await self.send(text, markup)
+
     async def set_webhook(self, url, secret):
-        r = await self.call("setWebhook", url=url, secret_token=secret, allowed_updates=["message"])
+        r = await self.call("setWebhook", url=url, secret_token=secret, allowed_updates=["message", "callback_query"])
         log.info("telegram setWebhook: %s", r)
 
     async def poll_loop(self):
@@ -151,18 +228,94 @@ class Telegram:
                 log.warning("telegram poll: %s", e); await asyncio.sleep(5)
 
     async def handle_update(self, u):
+        if u.get("callback_query"):
+            return await self.handle_callback(u["callback_query"])
         m = u.get("message") or {}
-        if str((m.get("chat") or {}).get("id")) != self.chat_id or not m.get("text", "").startswith("/"):
+        text = (m.get("text") or "").strip()
+        if str((m.get("chat") or {}).get("id")) != self.chat_id or not (text.startswith("/") or text == MENU_BTN):
             return
-        reply = await self.command(m["text"])
+        cmd = MENU_BTN if text == MENU_BTN else text.split()[0].split("@")[0].lower()
+        if cmd == "/start":
+            await self.send("🤖 <b>Copy-trader</b> · " + PAPER + "\nTap <b>☰ Menu</b> any time. Typed commands still work (/help).",
+                            REPLY_KB)
+        if cmd in ("/start", "/menu", MENU_BTN):
+            return await self.send(self.menu_text(), menu_kb(self.ctx.executor.paused()))
+        reply = await self.command(text)
         if reply:
             await self.send(reply)
+
+    def menu_text(self):
+        state = "⏸ paused" if self.ctx.executor.paused() else "▶️ running"
+        return f"🤖 <b>Copy-trader</b> · {PAPER} · {state}\nPick a view:"
+
+    async def handle_callback(self, q):
+        """Inline buttons. Only the configured chat is obeyed; every query is answered so the button stops spinning."""
+        msg, data, toast = q.get("message") or {}, q.get("data") or "", ""
+        try:
+            if str((msg.get("chat") or {}).get("id")) != self.chat_id or not self.chat_id:
+                toast = "Not authorized"
+                return
+            kind, _, rest = data.partition(":")
+            ex = self.ctx.executor
+            if kind == "m":
+                if rest == "menu":
+                    return await self.edit(msg, self.menu_text(), menu_kb(ex.paused()))
+                if rest == "toggle":
+                    out = await self.command("/resume" if ex.paused() else "/pause")
+                    toast = plain(out).split("\n")[0]
+                    return await self.edit(msg, out + "\n\n" + self.menu_text(), menu_kb(ex.paused()))
+                if rest == "set":
+                    return await self.edit(msg, self.settings(), settings_kb(self.ctx))
+                if rest in VIEWS:
+                    return await self.edit(msg, await self.command(VIEWS[rest]), kb(BACK))
+            elif kind == "s":
+                note = self.apply_preset(*rest.partition(":")[::2])
+                toast = plain(note)[:190]
+                return await self.edit(msg, note + "\n\n" + self.settings(), settings_kb(self.ctx))
+            elif kind == "p":
+                pid, _, mode = rest.partition(":")
+                if pid.isdigit() and mode in ("now", "2x", "3x", "follow"):
+                    out = esc(await ex.set_exit(int(pid), mode))
+                    toast = plain(out)[:190]
+                    return await self.send(f"🎛 {out}", kb(BACK))
+            toast = "Unknown button"
+        except Exception as e:
+            log.exception("callback %s failed: %s", data, e)
+            toast = "Something went wrong"
+        finally:
+            await self.call("answerCallbackQuery", callback_query_id=q.get("id"), **({"text": toast} if toast else {}))
+
+    def apply_preset(self, key, val):
+        """Settings buttons -> the same DB overrides /set writes. Size is still capped by max_per_trade_sol; live mode isn't a button."""
+        from .settings import set_value, trade_cap
+        ctx = self.ctx
+        if key == "sz" and _f(val) in SIZES:
+            want = _f(val)
+            cap = trade_cap(getattr(ctx, "cfg_base", ctx.cfg))
+            ok, msg = set_value(ctx, "trade_sol", f"{min(want, cap):g}")
+            if ok and want > cap + 1e-9:
+                return (f"⚠️ <b>{want:g} SOL is above the cap</b> ({cap:g} SOL per trade). Set to {cap:g} SOL. "
+                        "Raise execution.max_per_trade_sol in config.yaml to allow more.")
+        elif key == "cw" and val in {str(m) for m, _ in WINDOWS}:
+            ok, msg = set_value(ctx, "cluster_window", val)
+        elif key == "age" and val in {str(h) for h in AGES}:
+            ok, msg = set_value(ctx, "cluster_age_h", val)
+        elif key == "tp" and val in LADDERS:
+            if val == "f":
+                ok, msg = set_value(ctx, "exit_mode", "follow")
+            else:
+                ok, msg = set_value(ctx, "tp_ladder", LADDERS[val][1])
+                if ok:
+                    set_value(ctx, "exit_mode", "ladder")
+        else:
+            return "⚠️ Unknown setting button."
+        return ("✅ " if ok else "⚠️ ") + esc(msg)
 
     async def command(self, text):
         parts = text.strip().split()
         cmd, args = parts[0].split("@")[0].lower(), parts[1:]
         ctx, ex, db = self.ctx, self.ctx.executor, self.ctx.db
-        if cmd in ("/start", "/help"):
+        if cmd in ("/start", "/help", "/menu"):
             return HELP
         if cmd == "/pause":
             db.kv_set("paused", True); return "⏸ <b>Paused</b>\nNo new paper entries. Exits keep running."
