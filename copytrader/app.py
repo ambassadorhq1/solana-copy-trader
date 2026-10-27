@@ -184,6 +184,8 @@ def make_app(ctx, start_background=True):
     app.router.add_post("/tg", tg)
     app.router.add_post("/helius", helius)
     from .dashboard import add_routes
+    from .nonce import add_routes as nonce_routes
+    nonce_routes(app, ctx)  # GET /nonce-watch (alert-only)
     add_routes(app, ctx)  # GET /dashboard + GET /api/summary (read-only, key-protected)
 
     async def on_start(_):
